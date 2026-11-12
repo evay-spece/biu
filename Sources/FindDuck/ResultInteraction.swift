@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 struct ImmediateResultClick: NSViewRepresentable {
-    let select: ()->Void
+    let select: (NSEvent.ModifierFlags,Bool)->Void
     let hover: (CGPoint?)->Void
     let open: (Bool)->Void
     let menu: ()->NSMenu
@@ -11,7 +11,7 @@ struct ImmediateResultClick: NSViewRepresentable {
     }
     func updateNSView(_ view:Surface,context:Context) {view.select=select;view.hover=hover;view.open=open;view.makeMenu=menu}
     final class Surface:NSView {
-        var select:(()->Void)?
+        var select:((NSEvent.ModifierFlags,Bool)->Void)?
         var hover:((CGPoint?)->Void)?
         var open:((Bool)->Void)?
         var makeMenu:(()->NSMenu)?
@@ -30,11 +30,11 @@ struct ImmediateResultClick: NSViewRepresentable {
         override func acceptsFirstMouse(for event:NSEvent?)->Bool {true}
         override func mouseDown(with event:NSEvent) {
             // Select on mouse-down, without waiting for the double-click interval.
-            select?()
+            select?(event.modifierFlags,false)
             if event.clickCount == 2 {open?(event.modifierFlags.contains(.command))}
         }
         override func rightMouseDown(with event:NSEvent) {
-            select?()
+            select?(event.modifierFlags,true)
             if let menu=makeMenu?() {NSMenu.popUpContextMenu(menu,with:event,for:self)}
         }
     }

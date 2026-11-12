@@ -15,7 +15,11 @@ enum WechatLocations {
             (name.allSatisfy(\.isNumber) || name.hasSuffix("_t") && name.dropLast(2).allSatisfy(\.isNumber))
     }
     static func isSearchableChatAttachment(_ url:URL)->Bool {
-        isChatAttachment(url) && !isOpaqueImage(url)
+        isChatAttachment(url) && !isOpaqueImage(url) && !isVideoThumbnail(url)
+    }
+    static func isVideoThumbnail(_ url:URL)->Bool {
+        let path=url.path.lowercased()
+        return (path.contains("/msg/video/") || path.contains("/filestorage/video/")) && ["jpg","jpeg","png","gif","webp","heic","heif","bmp","tiff"].contains(url.pathExtension.lowercased())
     }
     static func isOutsideChatAttachments(_ url:URL)->Bool {
         let path=url.path.lowercased()

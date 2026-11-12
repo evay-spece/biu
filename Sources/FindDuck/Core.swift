@@ -6,8 +6,9 @@ struct FileHit: Identifiable, Codable, Hashable, Sendable {
     var created: Date?
     var added: Date?
     var isDirectory: Bool = false
+    var applicationNames: ApplicationNames? = nil
     init(url: URL, isDirectory: Bool = false, modified: Date? = nil, created: Date? = nil, added: Date? = nil) { self.url = url; self.isDirectory = isDirectory; self.modified=modified;self.created=created;self.added=added }
-    enum CodingKeys: String, CodingKey { case url, isDirectory, modified, created, added }
+    enum CodingKeys: String, CodingKey { case url, isDirectory, modified, created, added, applicationNames }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         url = try values.decode(URL.self, forKey: .url)
@@ -15,9 +16,11 @@ struct FileHit: Identifiable, Codable, Hashable, Sendable {
         created = try values.decodeIfPresent(Date.self, forKey: .created)
         added = try values.decodeIfPresent(Date.self, forKey: .added)
         isDirectory = try values.decodeIfPresent(Bool.self, forKey: .isDirectory) ?? false
+        applicationNames = try values.decodeIfPresent(ApplicationNames.self, forKey: .applicationNames)
     }
     var id: String { url.path }
     var name: String { url.lastPathComponent }
+    var applicationDisplayName: String { applicationNames?.displayName ?? url.deletingPathExtension().lastPathComponent }
 }
 struct DirectoryRecord: Codable, Sendable {
     let url: URL

@@ -25,6 +25,7 @@ enum DisplayPath {
         let parts=path.split(separator:"/").map(String.init)
         if let index=parts.firstIndex(where:{$0 == "xwechat_files" || $0 == "WeChat Files"}) {
             let tail=Array(parts.dropFirst(index+1))
+            if let video=tail.firstIndex(where:{$0.lowercased() == "video"}) {return "微信视频/"+tail.dropFirst(video+1).joined(separator:"/")}
             if let file=tail.firstIndex(where:{$0.lowercased() == "file"}) {return "微信文档/"+tail.dropFirst(file+1).joined(separator:"/")}
         }
         if path == home.path {return "/个人文件夹/"}
@@ -43,14 +44,43 @@ enum DisplayPath {
         return result
     }
 }
-@MainActor final class FilePreview:NSObject,@preconcurrency QLPreviewPanelDataSource {
+@MainActor final class FilePreview:NSObject,@preconcurrency QLPreviewPanelDataSource,@preconcurrency QLPreviewPanelDelegate {
     static let shared=FilePreview()
+    private var urls:[URL]=[]
     private var url:URL?
-    func show(_ file:FileHit) {
+    private weak var owner:NSWindow?
+    private var move:((Int)->Void)?
+    var isPresenting:Bool {QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared()?.isVisible == true}
+    func show(_ file:FileHit,owner:NSWindow?=nil,onMove:((Int)->Void)?=nil) {
         guard let panel=QLPreviewPanel.shared() else {return}
-        if panel.isVisible,url == file.url {panel.orderOut(nil);return}
-        url=file.url;panel.dataSource=self;panel.reloadData();panel.makeKeyAndOrderFront(nil)
+        if panel.isVisible,url == file.url {hide();return}
+        self.owner=owner ?? NSApp.keyWindow;move=onMove
+        urls=[file.url];url=file.url;panel.dataSource=self;panel.delegate=self;panel.reloadData()
+        panel.orderFront(nil)
     }
-    func numberOfPreviewItems(in panel:QLPreviewPanel!)->Int {url == nil ? 0 : 1}
-    func previewPanel(_ panel:QLPreviewPanel!,previewItemAt index:Int)->(any QLPreviewItem)! {url as NSURL?}
+    func show(_ files:[FileHit],owner:NSWindow?=nil) {
+        guard !files.isEmpty,let panel=QLPreviewPanel.shared() else {return}
+        self.owner=owner ?? NSApp.keyWindow;move=nil;urls=files.map(\.url);url=urls.first
+        panel.dataSource=self;panel.delegate=self;panel.reloadData();panel.orderFront(nil)
+    }
+    func update(_ file:FileHit) {
+        guard isPresenting,url != file.url,let panel=QLPreviewPanel.shared() else {return}
+        urls=[file.url];url=file.url;panel.reloadData()
+    }
+    func hide() {
+        if QLPreviewPanel.sharedPreviewPanelExists() {QLPreviewPanel.shared()?.orderOut(nil)}
+        move=nil;url=nil;urls=[]
+        if let owner,owner.isVisible {owner.makeKeyAndOrderFront(nil)}
+    }
+    func previewPanel(_ panel:QLPreviewPanel!,handle event:NSEvent!)->Bool {
+        guard let event,event.type == .keyDown else {return false}
+        switch event.keyCode {
+        case 125:move?(1);return move != nil
+        case 126:move?(-1);return move != nil
+        case 49,53:hide();return true
+        default:return false
+        }
+    }
+    func numberOfPreviewItems(in panel:QLPreviewPanel!)->Int {urls.count}
+    func previewPanel(_ panel:QLPreviewPanel!,previewItemAt index:Int)->(any QLPreviewItem)! {urls.indices.contains(index) ? urls[index] as NSURL : nil}
 }

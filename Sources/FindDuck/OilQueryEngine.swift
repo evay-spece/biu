@@ -5,6 +5,16 @@ import Darwin
 actor OilQueryEngine {
     private var applicationCatalog:[FileHit]=[]
     private var applicationCatalogDate=Date.distantPast
+    init(applicationCatalog: [FileHit]? = nil) {
+        if let applicationCatalog {
+            self.applicationCatalog = applicationCatalog
+            applicationCatalogDate = Date()
+        }
+    }
+    nonisolated static func isLaunchableApplication(_ url:URL)->Bool {
+        guard url.pathExtension.lowercased() == "app",let executable=Bundle(url:url)?.executableURL else {return false}
+        return FileManager.default.isExecutableFile(atPath:executable.path)
+    }
     private func matchingApplications(_ term:String,roots:[URL],preferences:DuckPreferences,scopeRoot:URL?)->[RankedHit] {
         if Date().timeIntervalSince(applicationCatalogDate)>3600 {
             let bases=[URL(fileURLWithPath:"/Applications",isDirectory:true),FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications",isDirectory:true),URL(fileURLWithPath:"/System/Applications",isDirectory:true),URL(fileURLWithPath:"/System/Library/CoreServices",isDirectory:true),URL(fileURLWithPath:"/System/Volumes/Preboot/Cryptexes/App/System/Applications",isDirectory:true)]
@@ -13,7 +23,10 @@ actor OilQueryEngine {
                 guard let enumerator=FileManager.default.enumerator(at:base,includingPropertiesForKeys:[.contentModificationDateKey],options:[.skipsHiddenFiles,.skipsPackageDescendants]) else {continue}
                 for case let url as URL in enumerator where url.pathExtension.lowercased() == "app" {
                     enumerator.skipDescendants()
-                    found[url.path]=FileHit(url:url,modified:(try? url.resourceValues(forKeys:[.contentModificationDateKey]))?.contentModificationDate)
+                    guard Self.isLaunchableApplication(url) else {continue}
+                    var file=FileHit(url:url,modified:(try? url.resourceValues(forKeys:[.contentModificationDateKey]))?.contentModificationDate)
+                    file.applicationNames=ApplicationNames.read(url)
+                    found[url.path]=file
                 }
             }
             applicationCatalog=Array(found.values);applicationCatalogDate=Date()
@@ -24,7 +37,7 @@ actor OilQueryEngine {
             roots.contains {DuckRules.under(file.url,$0)} &&
             (scopeRoot == nil || DuckRules.under(file.url,scopeRoot!)) &&
             preferences.blockedFiles?.contains(file.id) != true &&
-            file.url.deletingPathExtension().lastPathComponent.localizedStandardContains(term)
+            (file.applicationNames?.matches(term) ?? (term.isEmpty || SearchText.contains(file.url.deletingPathExtension().lastPathComponent,term)))
         }.enumerated().map {RankedHit(file:$0.element,score:Int32.max,position:$0.offset)}
     }
     private static func visibleDailyFile(_ url:URL)->Bool {
@@ -117,8 +130,9 @@ actor OilQueryEngine {
         if !Task.isCancelled {modifiedCache=(key,snapshot)}
         return snapshot
     }
-    func search(local:[OilStoreHandle],sharedSnapshot:NameIndex?,term:String,category:ResultCategory,sort:ResultSort,preferences:DuckPreferences,opened:[String:Date],limit:Int,scopeRoot:URL? = nil) -> AcceleratedResults {
-        let handles=local + (sharedHandle(sharedSnapshot).map {[$0]} ?? [])
+    func search(local:[OilStoreHandle],sharedSnapshot:NameIndex?,term:String,category:ResultCategory,sort:ResultSort,preferences:DuckPreferences,opened:[String:Date],limit:Int,scopeRoot:URL? = nil,applicationOrder:ApplicationOrdering = ApplicationOrdering()) -> AcceleratedResults {
+        let applicationScope=scopeRoot?.standardizedFileURL.path == "/Applications"
+        let handles=applicationScope ? [] : local + (sharedHandle(sharedSnapshot).map {[$0]} ?? [])
         let activeIDs=Set(handles.map(\.id));previous=previous.filter {activeIDs.contains($0.key)}
         let kind:UInt8?
         switch category {
@@ -178,7 +192,7 @@ actor OilQueryEngine {
                     }
                 };continue
             }
-            let query=Query.parse(term,store:handle.store)
+            let query=SearchText.query(term,store:handle.store)
             guard let result=Searcher.search(query,options:options,in:handle.store,previous:previous[handle.id],isCancelled:{Task.isCancelled}) else {continue}
             previous[handle.id]=result
             var positions:[Int]=[],overrides:[UInt32:Int32]=[:]
@@ -222,7 +236,7 @@ actor OilQueryEngine {
                     if let scopeRoot,!DuckRules.under(file.url,scopeRoot) || file.url.standardizedFileURL == scopeRoot.standardizedFileURL {continue}
                     if preferences.suppressNoise && DuckRules.suspicious(file) && !WechatLocations.isSearchableChatAttachment(file.url) {continue}
                     let labels=preferences.annotationText(file.id)
-                    if taggedMatches.contains(id) || term.isEmpty || labels.localizedStandardContains(term) {
+                    if taggedMatches.contains(id) || term.isEmpty || SearchText.contains(labels,term) {
                         total += 1;collected.append(RankedHit(file:file,score:Int32.max,position:0))
                     }
                 }
@@ -238,20 +252,27 @@ actor OilQueryEngine {
                 for (position,item) in page.enumerated() {collected.append(RankedHit(file:hit(handle.store,item.0),score:item.1,position:position))}
             }
         }
-        if category == .all && !term.isEmpty && !local.isEmpty {
-            let roots=local.map {handle in URL(fileURLWithPath:handle.store.read {handle.store.rootPath},isDirectory:true)}
-            let apps=matchingApplications(term,roots:roots,preferences:preferences,scopeRoot:scopeRoot)
+        if category == .all && (applicationScope || (!term.isEmpty && !local.isEmpty)) {
+            let roots=applicationScope ? [URL(fileURLWithPath:"/")] : local.map {handle in URL(fileURLWithPath:handle.store.read {handle.store.rootPath},isDirectory:true)}
+            let apps=matchingApplications(term,roots:roots,preferences:preferences,scopeRoot:applicationScope ? nil : scopeRoot)
             total += apps.count;collected.append(contentsOf:apps)
         }
         // Individual native pages contain every candidate needed for the global page.
         let installedAppIDs=Set(applicationCatalog.map(\.id))
+        let installedApps=Dictionary(uniqueKeysWithValues:applicationCatalog.map {($0.id,$0)})
+        collected=collected.map { hit in
+            guard let app=installedApps[hit.file.id] else {return hit}
+            var file=hit.file;file.applicationNames=app.applicationNames
+            return RankedHit(file:file,score:hit.score,position:hit.position)
+        }
         let sorted=collected.sorted {a,b in
+            if applicationScope && sort == .relevance {return applicationOrder.precedes(a.file,b.file)}
             let appA=installedAppIDs.contains(a.file.id),appB=installedAppIDs.contains(b.file.id)
             if appA != appB {return appA}
             let at=annotated.contains(a.file.id),bt=annotated.contains(b.file.id);if at != bt {return at}
             if (sort == .modified || (sort == .relevance && term.isEmpty && scopeRoot != nil)) && a.file.modified != b.file.modified {return (a.file.modified ?? .distantPast) > (b.file.modified ?? .distantPast)}
             if (sort == .relevance || sort == .recent) && a.score != b.score {return a.score > b.score}
-            if sort == .name {let order=a.file.name.localizedStandardCompare(b.file.name);if order != .orderedSame {return order == .orderedAscending}}
+            if sort == .name {let order=(appA ? a.file.applicationDisplayName : a.file.name).localizedStandardCompare(appB ? b.file.applicationDisplayName : b.file.name);if order != .orderedSame {return order == .orderedAscending}}
             return a.position == b.position ? a.file.id < b.file.id : a.position < b.position
         }
         var seen=Set<String>();let unique=sorted.filter {seen.insert($0.file.id).inserted}

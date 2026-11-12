@@ -23,7 +23,7 @@ actor SearchAccelerator {
     private var entries:[Entry]=[]
     private var previousTerm=""
     private var previousMatches:[Int]=[]
-    private static func fold(_ text:String) -> String {text.folding(options:[.caseInsensitive,.diacriticInsensitive],locale:.current).precomposedStringWithCanonicalMapping}
+    private static func fold(_ text:String) -> String {SearchText.fold(text)}
     @inline(__always) private static func contains(_ text:String,_ needle:[UInt8]) -> Bool {
         if needle.isEmpty {return true}
         return text.utf8.withContiguousStorageIfAvailable { bytes in
@@ -55,7 +55,7 @@ actor SearchAccelerator {
         let needle=Self.fold(term)
         let needleBytes=Array(needle.utf8)
         // Annotation changes can add matches without changing the filename snapshot.
-        var matches=Array(entries.indices).filter {needle.isEmpty || Self.contains(entries[$0].key,needleBytes) || preferences.annotationText(entries[$0].file.id).localizedStandardContains(term)}
+        var matches=Array(entries.indices).filter {needle.isEmpty || Self.contains(entries[$0].key,needleBytes) || SearchText.contains(preferences.annotationText(entries[$0].file.id),term)}
         let exclusions=DuckExclusions(preferences.effectiveBlacklist)
         func eligible(_ entry:Entry) -> Bool {
             if exclusions.contains(entry.file.url) || preferences.blockedFiles?.contains(entry.file.id) == true  {return false}
@@ -97,7 +97,7 @@ actor SearchAccelerator {
                 let a=opened[active[$0].file.id] ?? .distantPast,b=opened[active[$1].file.id] ?? .distantPast
                 return a == b ? active[$0].file.id < active[$1].file.id : a > b
             }
-            matches=Array(recent.prefix(50)).filter {needle.isEmpty || Self.contains(active[$0].key,needleBytes) || preferences.annotationText(active[$0].file.id).localizedStandardContains(term)}
+            matches=Array(recent.prefix(50)).filter {needle.isEmpty || Self.contains(active[$0].key,needleBytes) || SearchText.contains(preferences.annotationText(active[$0].file.id),term)}
         }
         func better(_ a:Candidate,_ b:Candidate) -> Bool {
             let left=active[a.entry],right=active[b.entry]

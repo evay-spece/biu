@@ -39,7 +39,7 @@ import AppKit
         let first = entry(0)
         let atBoundary = entry(600)
         let newSession = entry(1201)
-        let groups = ClipboardSession.group([atBoundary, first, newSession])
+        let groups = ClipboardSession.group([atBoundary, first, newSession], now: start.addingTimeInterval(1800))
         XCTAssertEqual(groups.map { $0.entries.map(\.id) },
                        [[newSession.id], [atBoundary.id, first.id]])
     }
@@ -127,6 +127,45 @@ import AppKit
         store.copy(store.items[0],to:restored)
         let copied=(restored.readObjects(forClasses:[NSURL.self],options:[.urlReadingFileURLsOnly:true]) as? [URL]) ?? []
         XCTAssertEqual(copied.map(\.path),[file.path])
+    }
+    func testClipboardImageAndFilesCanBeSavedWithoutChangingHistory() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let board = NSPasteboard(name: NSPasteboard.Name(UUID().uuidString))
+        defer { board.releaseGlobally() }
+        let store = ClipboardHistoryStore(directory: directory.appendingPathComponent("history"), pasteboard: board, monitor: false)
+        let image = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                     isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        let png = try XCTUnwrap(image.representation(using: .png, properties: [:]))
+        board.clearContents(); board.setData(png, forType: .png); store.capture()
+        let imageEntry = try XCTUnwrap(store.items.first)
+        let savedImage = directory.appendingPathComponent("saved.png")
+        try Data("old".utf8).write(to: savedImage)
+        try store.save(imageEntry, to: savedImage)
+        XCTAssertEqual(try Data(contentsOf: savedImage), png)
+
+        let first = directory.appendingPathComponent("first.txt")
+        let second = directory.appendingPathComponent("second.txt")
+        try "one".write(to: first, atomically: true, encoding: .utf8)
+        try "two".write(to: second, atomically: true, encoding: .utf8)
+        board.clearContents(); board.writeObjects([first as NSURL]); store.capture()
+        let singleFile = try XCTUnwrap(store.items.first)
+        let renamed = directory.appendingPathComponent("renamed.txt")
+        try "old".write(to: renamed, atomically: true, encoding: .utf8)
+        try store.save(singleFile, to: renamed)
+        XCTAssertEqual(try String(contentsOf: renamed, encoding: .utf8), "one")
+        board.clearContents(); board.writeObjects([first as NSURL, second as NSURL]); store.capture()
+        let multipleFiles = try XCTUnwrap(store.items.first)
+        let output = directory.appendingPathComponent("output")
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        try "existing".write(to: output.appendingPathComponent("first.txt"), atomically: true, encoding: .utf8)
+        try store.saveFiles(multipleFiles, into: output)
+        XCTAssertEqual(try String(contentsOf: output.appendingPathComponent("first.txt"), encoding: .utf8), "existing")
+        XCTAssertEqual(try String(contentsOf: output.appendingPathComponent("first 2.txt"), encoding: .utf8), "one")
+        XCTAssertEqual(try String(contentsOf: output.appendingPathComponent("second.txt"), encoding: .utf8), "two")
+        XCTAssertEqual(store.items.count, 3)
     }
     func testShoppingLinksAndIDs() throws {
         XCTAssertEqual(try TmallLinkParser.analyze("https://detail.tmall.com/item.htm?id=123456789&spm=test").url,"https://detail.tmall.com/item.htm?id=123456789")

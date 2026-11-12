@@ -1,7 +1,4 @@
 .build/
-build/
 .DS_Store
-*.app
-*.zip
-*.dmg
+build/
 *.log

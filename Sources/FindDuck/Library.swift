@@ -10,34 +10,38 @@ enum SourceFilter:String,CaseIterable,Identifiable {case all="本地＋共享盘
 struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKind;var id:String {url.standardizedFileURL.path}}
 @MainActor final class SearchLibrary:ObservableObject {
     @Published var sources:[SearchRoot]=[]
-    @Published var query=""
-    @Published var tagFilter:String? {didSet {if !batching {search()}}}
-    @Published var additionalTagFilters:[String]=[] {didSet {if !batching {search()}}}
+    @Published var query="" {willSet {if newValue != query {recordSearchStep("query")}}}
+    @Published var tagFilter:String? {willSet {if newValue != tagFilter {recordSearchStep("tags")}} didSet {if !batching {search()}}}
+    @Published var additionalTagFilters:[String]=[] {willSet {if newValue != additionalTagFilters {recordSearchStep("tags")}} didSet {if !batching {search()}}}
     var selectedTagIDs:[String] {(tagFilter.map {[$0]} ?? [])+additionalTagFilters}
-    private var conditionOrder:[String]=[]
-    func markCondition(_ key:String) {conditionOrder.removeAll {$0 == key};conditionOrder.append(key)}
+    private var conditions = FilterCancellation<String>()
+    private func recordSearchStep(_ kind: String) {
+        guard !batching else { return }
+        conditions.record(kind, active: true)
+    }
     func toggleTagSelection(_ id:String) {
+        conditions.record("tag:" + id, active: !selectedTagIDs.contains(id))
         batching=true
         if tagFilter == id {tagFilter=additionalTagFilters.first;additionalTagFilters=Array(additionalTagFilters.dropFirst())}
         else if additionalTagFilters.contains(id) {additionalTagFilters.removeAll {$0 == id}}
-        else if tagFilter == nil {tagFilter=id;markCondition("tag:"+id)}
-        else {additionalTagFilters.append(id);markCondition("tag:"+id)}
+        else if tagFilter == nil {tagFilter=id}
+        else {additionalTagFilters.append(id)}
         batching=false;search()
     }
-    func clearTagSelection() {batching=true;tagFilter=nil;additionalTagFilters=[];batching=false;search()}
+    func clearTagSelection() {if !selectedTagIDs.isEmpty {recordSearchStep("tags")};batching=true;tagFilter=nil;additionalTagFilters=[];batching=false;search()}
     var isHome:Bool {query.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty && scopeTitle == nil && selectedTagIDs.isEmpty}
     @Published private(set) var searchHistory:[String]=[]
     private var historyTask:Task<Void,Never>?
     private var historyCandidate=""
     @Published private(set) var directoryShortcuts:[URL]=[]
     @Published private(set) var directoryScope:URL?
-    var scopeTitle:String? {directoryScope.map { DisplayPath.name($0) } ?? (quickScope != .none ? quickScope.rawValue : !localSelected && sharedSelected ? "共享盘" : nil)}
+    var scopeTitle:String? {directoryScope?.path == "/Applications" ? "所有程序" : directoryScope.map { DisplayPath.name($0) } ?? (quickScope != .none ? quickScope.rawValue : !localSelected && sharedSelected ? "共享盘" : nil)}
     @Published var preferences=DuckPreferences()
-    @Published var category:ResultCategory = .all {didSet {if !batching && category != oldValue {search()}}}
-    @Published var resultSort:ResultSort = .relevance {didSet {if !batching && resultSort != oldValue {if resultSort == .recent {refreshRecents()};search()}}}
-    @Published var quickScope:QuickScope = .none {didSet {if !batching && quickScope != oldValue {search()}}}
-    @Published var localSelected=true {didSet {if !batching && localSelected != oldValue {search()}}}
-    @Published var sharedSelected=true {didSet {if !batching && sharedSelected != oldValue {search()}}}
+    @Published var category:ResultCategory = .all {willSet {if newValue != category {recordSearchStep("category")}} didSet {if !batching && category != oldValue {search()}}}
+    @Published var resultSort:ResultSort = .relevance {willSet {if newValue != resultSort {recordSearchStep("sort")}} didSet {if !batching && resultSort != oldValue {if resultSort == .recent {refreshRecents()};search()}}}
+    @Published var quickScope:QuickScope = .none {willSet {if newValue != quickScope {recordSearchStep("scope")}} didSet {if !batching && quickScope != oldValue {search()}}}
+    @Published var localSelected=true {willSet {if newValue != localSelected {recordSearchStep("scope")}} didSet {if !batching && localSelected != oldValue {search()}}}
+    @Published var sharedSelected=true {willSet {if newValue != sharedSelected {recordSearchStep("scope")}} didSet {if !batching && sharedSelected != oldValue {search()}}}
     var sourceFilter:SourceFilter {localSelected && sharedSelected ? .all : localSelected ? .local : .shared}
     @Published var hits:[FileHit]=[]
     @Published private(set) var resultCount=0
@@ -267,6 +271,8 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
     func clearResults() {cancelSearch();hits=[];resultCount=0;lastRequest=""}
     func loadMoreResults() {displayLimit += 200;search()}
     func updateScope() {search()}
+    var pinnedApplications=Set<String>()
+    var recentApplications:[String:Date]=[:]
     func search() {
         cancelSearch()
         let term=query.trimmingCharacters(in:.whitespacesAndNewlines),quick=quickScope
@@ -279,7 +285,7 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
         if today && compact == nil {hits=[];resultCount=0;isSearching=true;if !refreshingQuick {refreshToday(quick)};return}
         let local=localSelected ? localEngines.values.compactMap(\.handle) : []
         let shared=sharedSelected ? index : nil
-        if !today && !hasIndex && quick != .recent && !(sharedSelected && deepQuery == term && !deepHits.isEmpty) {hits=[];resultCount=0;status="Oil Find 首次索引正在建立，请稍候。";return}
+        if !today && !hasIndex && directoryScope?.standardizedFileURL.path != "/Applications" && quick != .recent && !(sharedSelected && deepQuery == term && !deepHits.isEmpty) {hits=[];resultCount=0;status="Oil Find 首次索引正在建立，请稍候。";return}
         status=""
         if !term.isEmpty {scheduleHistory(term)}
         let request="\(directoryScope?.path ?? "")|\(term)|\(quick.rawValue)|\(category.rawValue)|\(resultSort.rawValue)|\(localSelected)|\(sharedSelected)|\(preferences.suppressNoise)|\(selectedTagIDs.joined(separator:","))"
@@ -287,6 +293,7 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
         let id=UUID();searchID=id;isSearching=true
         let prefs:DuckPreferences={var value=preferences;value.tagFilter=tagFilter;value.tagFilters=selectedTagIDs;return value}()
         let oilSearch=oilSearch,compactSearch=compactSearch,system=systemOpened,sort=resultSort,category=category,limit=displayLimit
+        let appOrder=ApplicationOrdering(running:Set(NSWorkspace.shared.runningApplications.filter {$0.activationPolicy == .regular}.compactMap {$0.bundleURL?.standardizedFileURL.path}),pinned:pinnedApplications,recent:recentApplications)
         let scopeRoot=directoryScope
         let downloads=FileManager.default.urls(for:.downloadsDirectory,in:.userDomainMask)[0]
         let deep=(sharedSelected && deepQuery == term) ? deepHits : []
@@ -309,7 +316,7 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
                     for file in deep {records[file.id]=file}
                     sharedSnapshot=NameIndex(root:URL(fileURLWithPath:"/"),created:Date(),files:Array(records.values),directories:shared?.directories ?? deepFolders)
                 }
-                return await oilSearch.search(local:local,sharedSnapshot:sharedSnapshot,term:term,category:category,sort:sort,preferences:prefs,opened:opened,limit:limit,scopeRoot:scopeRoot)
+                return await oilSearch.search(local:local,sharedSnapshot:sharedSnapshot,term:term,category:category,sort:sort,preferences:prefs,opened:opened,limit:limit,scopeRoot:scopeRoot,applicationOrder:appOrder)
             }
             let result=await withTaskCancellationHandler {await worker.value} onCancel:{worker.cancel()}
             guard !Task.isCancelled,searchID == id else {return}
@@ -338,6 +345,7 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
         }
     }
     func activateQuick(_ quick:QuickScope) {
+        recordSearchStep("scope")
         quickTask?.cancel();quickID=UUID();refreshingQuick=false;quickRefreshStatus=""
         batching=true;directoryScope=nil;quickScope=quick;localSelected=true;sharedSelected=quick == .recent || quick == .modified
         if quick == .recent {resultSort = .recent}
@@ -352,7 +360,7 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
     }
     func showHome() {
         rememberSearch(query);historyTask?.cancel();historyTask=nil;historyCandidate=""
-        batching=true;query="";tagFilter=nil;additionalTagFilters=[];category = .all;directoryScope=nil;quickScope = .none;localSelected=true;sharedSelected=true;batching=false;conditionOrder=[]
+        batching=true;query="";tagFilter=nil;additionalTagFilters=[];category = .all;directoryScope=nil;quickScope = .none;localSelected=true;sharedSelected=true;batching=false;conditions = FilterCancellation()
         status="";deepStatus="";search()
     }
     func rememberSearch(_ value:String) {
@@ -371,12 +379,15 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
     func recallSearch(_ term:String) {query=term;rememberSearch(term);search()}
     func clearSearchHistory() {historyTask?.cancel();historyTask=nil;historyCandidate=query.trimmingCharacters(in:.whitespacesAndNewlines);searchHistory=[];save(searchHistory,to:"search-history.json")}
     func clearScope() {
+        recordSearchStep("scope")
         batching=true;directoryScope=nil;quickScope = .none;localSelected=true;sharedSelected=true;batching=false;search()
     }
     func activateShared() {
+        recordSearchStep("scope")
         batching=true;directoryScope=nil;quickScope = .none;localSelected=false;sharedSelected=true;batching=false;search();for engine in sharedEngines.values {engine.requestUserRefresh()}
     }
     func activateDirectory(_ url:URL) {
+        recordSearchStep("scope")
         batching=true;directoryScope=url.standardizedFileURL;quickScope = .none;localSelected=true;sharedSelected=true;batching=false;search()
     }
     func addDirectoryShortcut(_ url:URL,kind:SourceKind) {
@@ -497,6 +508,11 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
         if enabled {ids.insert(tag.id)} else {ids.remove(tag.id)}
         mapping[file.id]=ids.isEmpty ? nil : ids;preferences.fileTags=mapping;preserveHitOrder=true;savePreferences();refreshAnnotationAvailability();search()
     }
+    func setTags(_ files:[FileHit],_ tag:FileTag,enabled:Bool) {
+        var mapping=preferences.fileTags ?? [:]
+        for file in files {var ids=mapping[file.id] ?? [];if enabled {ids.insert(tag.id)} else {ids.remove(tag.id)};mapping[file.id]=ids.isEmpty ? nil : ids}
+        preferences.fileTags=mapping;preserveHitOrder=true;savePreferences();refreshAnnotationAvailability();search()
+    }
     func clearTags(_ file:FileHit) {preferences.fileTags?.removeValue(forKey:file.id);preserveHitOrder=true;savePreferences();refreshAnnotationAvailability();search()}
     @discardableResult func createTag(name:String,color:FileMarkColor,applyTo file:FileHit)->FileTag? {
         let name=name.trimmingCharacters(in:.whitespacesAndNewlines);guard !name.isEmpty else {return nil}
@@ -517,6 +533,13 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
     func blockFile(_ file:FileHit) {var paths=preferences.blockedFiles ?? [];paths.insert(file.id);preferences.blockedFiles=paths;savePreferences();refreshAnnotationAvailability();search()}
     func unblockFile(_ path:String) {preferences.blockedFiles?.remove(path);savePreferences();refreshAnnotationAvailability();search()}
     func setNote(_ text:String,file:FileHit) {var notes=preferences.fileNotes ?? [:];let text=text.trimmingCharacters(in:.whitespacesAndNewlines);notes[file.id]=text.isEmpty ? nil : text;preferences.fileNotes=notes;preserveHitOrder=true;savePreferences();refreshAnnotationAvailability();search()}
+    func chooseNotes(_ files:[FileHit]) {
+        guard let first=files.first else {return}
+        if files.count == 1 {chooseNote(first);return}
+        let alert=NSAlert();alert.messageText="为所选 \(files.count) 项设置备注";alert.addButton(withTitle:"保存");alert.addButton(withTitle:"取消")
+        let field=NSTextField(frame:NSRect(x:0,y:0,width:340,height:28));alert.accessoryView=field;alert.window.initialFirstResponder=field
+        if alert.runModal() == .alertFirstButtonReturn {for file in files {setNote(field.stringValue,file:file)}}
+    }
     func chooseNote(_ file:FileHit) {
         let alert=NSAlert();alert.messageText="文件备注";alert.informativeText="仅用于当前文件，留空可移除备注。";alert.addButton(withTitle:"保存");alert.addButton(withTitle:"取消")
         let field=NSTextField(frame:NSRect(x:0,y:0,width:340,height:28));field.stringValue=preferences.fileNotes?[file.id] ?? "";field.setAccessibilityLabel("文件备注");alert.accessoryView=field;alert.window.initialFirstResponder=field
@@ -539,17 +562,45 @@ struct SearchRoot:Codable,Identifiable,Equatable {let url:URL;var kind:SourceKin
         if alert.runModal() == .alertFirstButtonReturn {if createTag(name:field.stringValue,color:color,applyTo:file) == nil {status="标签文字不能为空。"}}
     }
     func consumeEscape()->Bool {
-        while let key=conditionOrder.popLast() {
-            if key == "query",!query.isEmpty {rememberSearch(query);query="";search();return true}
-            if key == "scope",scopeTitle != nil {clearScope();return true}
-            if key == "category",category != .all {category = .all;return true}
-            if key.hasPrefix("tag:") {let id=String(key.dropFirst(4));if selectedTagIDs.contains(id) {toggleTagSelection(id);return true}}
+        while let condition = conditions.pop() {
+            batching = true
+            var cancelled = true
+            switch condition {
+            case "query":
+                cancelled = !query.isEmpty
+                if cancelled { rememberSearch(query); query = "" }
+            case "category":
+                cancelled = category != .all
+                category = .all
+            case "scope":
+                cancelled = scopeTitle != nil || !localSelected || !sharedSelected
+                directoryScope = nil; quickScope = .none; localSelected = true; sharedSelected = true
+            case "sort":
+                cancelled = resultSort != .relevance
+                resultSort = .relevance
+            case "tags":
+                cancelled = !selectedTagIDs.isEmpty
+                tagFilter = nil; additionalTagFilters = []
+            default:
+                let id = String(condition.dropFirst("tag:".count))
+                cancelled = selectedTagIDs.contains(id)
+                let remaining = selectedTagIDs.filter { $0 != id }
+                tagFilter = remaining.first
+                additionalTagFilters = Array(remaining.dropFirst())
+            }
+            batching = false
+            if cancelled { search(); return true }
         }
-        if !query.isEmpty {rememberSearch(query);query="";search();return true}
-        if scopeTitle != nil {clearScope();return true}
-        if let id=selectedTagIDs.last {toggleTagSelection(id);return true}
-        if category != .all {category = .all;return true}
         return false
+    }
+    func requestTrash(_ files:[FileHit]) {
+        guard !files.isEmpty else {return}
+        if files.count == 1 {requestTrash(files[0]);return}
+        let alert=NSAlert();alert.messageText="将所选 \(files.count) 项移到废纸篓？";alert.informativeText="不支持废纸篓的磁盘会保留原文件。";alert.addButton(withTitle:"取消");alert.addButton(withTitle:"移到废纸篓")
+        if alert.runModal() == .alertSecondButtonReturn {
+            let targets=files.filter {file in !files.contains {$0.id != file.id && $0.isDirectory && DuckRules.under(file.url,$0.url)}}
+            Task {for file in targets {await trash(file)}}
+        }
     }
     func requestTrash(_ file:FileHit) {
         let alert=NSAlert();alert.messageText="将“\(file.name)”移到废纸篓？"

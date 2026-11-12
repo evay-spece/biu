@@ -37,6 +37,10 @@ struct QuickEntryFlow: Layout {
             widest = max(widest, x + size.width)
             x += size.width + spacing
         }
+        let rowHeights = Dictionary(grouping: frames, by: { $0.minY }).mapValues { $0.map(\.height).max() ?? 0 }
+        for index in frames.indices {
+            frames[index].origin.y += ((rowHeights[frames[index].minY] ?? frames[index].height) - frames[index].height) / 2
+        }
         return (CGSize(width: width.isFinite ? width : widest, height: y + height), frames)
     }
 }

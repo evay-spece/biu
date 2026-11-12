@@ -5,5 +5,5 @@ let package=Package(name:"FindDuckOil",platforms:[.macOS(.v14)],products:[.execu
  .target(name:"OilFindCore",dependencies:["COilFind"],path:"Vendor/OilFind/Sources/OilFindCore",swiftSettings:[.swiftLanguageMode(.v5)]),
  .executableTarget(name:"FindDuck",dependencies:["OilFindCore"],path:"Sources/FindDuck",swiftSettings:[.swiftLanguageMode(.v6),.unsafeFlags(["-warnings-as-errors"])],linkerSettings:[.linkedFramework("AppKit"),.linkedFramework("SwiftUI"),.linkedFramework("Carbon"),.linkedFramework("CoreServices")]),
  .testTarget(name:"OilFindCoreTests",dependencies:["OilFindCore","COilFind"],path:"Vendor/OilFind/Tests/OilFindCoreTests",swiftSettings:[.swiftLanguageMode(.v5)]),
- .testTarget(name:"FindDuckCoreTests",dependencies:["FindDuck","OilFindCore"],path:"Tests/FindDuckCoreTests",swiftSettings:[.swiftLanguageMode(.v6)])
+ .testTarget(name:"FindDuckCoreTests",dependencies:["FindDuck","OilFindCore"],path:"Tests/FindDuckCoreTests",resources:[.copy("Fixtures")],swiftSettings:[.swiftLanguageMode(.v6)])
 ])

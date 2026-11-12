@@ -1,15 +1,16 @@
 import AppKit
 import CryptoKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ClipboardEntry:Codable,Identifiable,Equatable {
     enum Kind:String,Codable {case text,image,file}
     var id=UUID()
     let kind:Kind
-    let text:String?
+    var text:String?
     let imageName:String?
     var filePaths:[String]? = nil
-    let fingerprint:String
+    var fingerprint:String
     var captured:Date=Date()
     var favorite: Bool? = nil
     var sourceBundleID: String? = nil
@@ -26,14 +27,17 @@ struct ClipboardEntry:Codable,Identifiable,Equatable {
 }
 
 @MainActor final class ClipboardHistoryStore:ObservableObject {
-    @Published private(set) var items:[ClipboardEntry]=[]
+    @Published private(set) var items:[ClipboardEntry]=[] { didSet { revision &+= 1 } }
+    private(set) var revision: UInt64 = 0
     @Published var error=""
     private let directory:URL
     private let pasteboard:NSPasteboard
     private var timer:Timer?
     private var lastChangeCount:Int = -1
+    private let history:UserActionHistory
     private let capacity: Int
-    init(directory:URL?=nil,pasteboard:NSPasteboard = .general,monitor:Bool=true, capacity: Int = 1_000_000_000) {
+    init(directory:URL?=nil,pasteboard:NSPasteboard = .general,monitor:Bool=true, capacity: Int = 1_000_000_000,history:UserActionHistory? = nil) {
+        self.history=history ?? .shared
         self.capacity = capacity
         self.directory=directory ?? BiuStorage.directory.appendingPathComponent("clipboard-history",isDirectory:true)
         self.pasteboard=pasteboard
@@ -50,6 +54,62 @@ struct ClipboardEntry:Codable,Identifiable,Equatable {
         }
     }
     func imageURL(for entry:ClipboardEntry)->URL? {entry.imageName.map {directory.appendingPathComponent($0)}}
+    func saveSourceURLs(for entry: ClipboardEntry) -> [URL] {
+        switch entry.kind {
+        case .text: return []
+        case .image: return imageURL(for: entry).map { [$0] } ?? []
+        case .file: return (entry.filePaths ?? []).map { URL(fileURLWithPath: $0) }
+        }
+    }
+
+    func save(_ entry: ClipboardEntry, to destination: URL) throws {
+        let sources = saveSourceURLs(for: entry)
+        guard let source = sources.first, sources.count == 1 else { throw SaveError.invalidEntry }
+        guard FileManager.default.fileExists(atPath: source.path) else { throw SaveError.sourceMissing }
+        if source.standardizedFileURL == destination.standardizedFileURL { return }
+        let manager = FileManager.default
+        if manager.fileExists(atPath: destination.path) {
+            let staged = destination.deletingLastPathComponent()
+                .appendingPathComponent(".findduck-save-\(UUID().uuidString)")
+            defer { try? manager.removeItem(at: staged) }
+            try manager.copyItem(at: source, to: staged)
+            _ = try manager.replaceItemAt(destination, withItemAt: staged)
+        } else {
+            try manager.copyItem(at: source, to: destination)
+        }
+    }
+
+    func saveFiles(_ entry: ClipboardEntry, into directory: URL) throws {
+        let sources = saveSourceURLs(for: entry)
+        guard entry.kind == .file, sources.count > 1 else { throw SaveError.invalidEntry }
+        let manager = FileManager.default
+        for source in sources {
+            guard manager.fileExists(atPath: source.path) else { throw SaveError.sourceMissing }
+        }
+        for source in sources {
+            let name = source.lastPathComponent
+            var destination = directory.appendingPathComponent(name)
+            var suffix = 2
+            while manager.fileExists(atPath: destination.path) {
+                let extensionName = source.pathExtension
+                let stem = source.deletingPathExtension().lastPathComponent
+                let candidate = "\(stem) \(suffix)" + (extensionName.isEmpty ? "" : ".\(extensionName)")
+                destination = directory.appendingPathComponent(candidate)
+                suffix += 1
+            }
+            try manager.copyItem(at: source, to: destination)
+        }
+    }
+
+    enum SaveError: LocalizedError {
+        case invalidEntry, sourceMissing
+        var errorDescription: String? {
+            switch self {
+            case .invalidEntry: "这条记录无法另存为"
+            case .sourceMissing: "原文件已不存在，无法另存为"
+            }
+        }
+    }
     func capture() {
         let count=pasteboard.changeCount
         guard count != lastChangeCount else {return}
@@ -112,14 +172,44 @@ struct ClipboardEntry:Codable,Identifiable,Equatable {
     func clearHistory() { commit([]) }
 
     func remove(_ entry: ClipboardEntry) {
-        commit(items.filter { $0.id != entry.id })
+        guard let position=items.firstIndex(where:{$0.id == entry.id}) else {return}
+        let backup:UndoMediaBackup
+        do {backup=try UndoMediaBackup(imageURL(for:entry).map {[$0]} ?? [])} catch {self.error="无法备份删除内容";return}
+        if commit(items.filter { $0.id != entry.id }) {
+            history.record("删除剪贴板记录",cost:backup.byteCount) { [weak self] in
+                guard let self else {return false}
+                do {try backup.restore()} catch {return false}
+                var restored=self.items;restored.removeAll {$0.id == entry.id};restored.insert(entry,at:min(position,restored.count))
+                return self.commit(restored,keeping:entry.id)
+            }
+        }
+    }
+
+    @discardableResult func updateText(_ entry:ClipboardEntry,text:String)->Bool {
+        guard entry.kind == .text,!text.isEmpty,let index=items.firstIndex(where:{$0.id == entry.id}) else {error="这条记录已不存在或文本为空";return false}
+        let previous=items[index]
+        guard previous.text != text else {return true}
+        var updated=items
+        updated[index].text=text
+        updated[index].fingerprint=Self.fingerprint(Data(text.utf8))
+        updated[index].richText=nil
+        guard commit(updated) else {return false}
+        history.record("编辑剪贴板文本") { [weak self] in
+            guard let self,let current=self.items.firstIndex(where:{$0.id == previous.id}) else {return false}
+            var restored=self.items;restored[current].text=previous.text;restored[current].fingerprint=previous.fingerprint;restored[current].richText=previous.richText
+            return self.commit(restored)
+        }
+        return true
     }
 
     func toggleFavorite(_ entry: ClipboardEntry) {
         guard let index = items.firstIndex(where: { $0.id == entry.id }) else { return }
         var updated = items
         updated[index].favorite = updated[index].favorite != true
-        commit(updated)
+        if commit(updated) {history.record("收藏") { [weak self] in
+            guard let self,let i=self.items.firstIndex(where:{$0.id == entry.id}) else {return false}
+            var restored=self.items;restored[i].favorite=entry.favorite;return self.commit(restored)
+        }}
     }
 
     private func promote(_ entry: ClipboardEntry, source: String?) {
@@ -198,32 +288,50 @@ struct ClipboardSession: Identifiable {
     let entries: [ClipboardEntry]
     var id: UUID { entries[entries.count - 1].id }
 
-    static func group(_ entries: [ClipboardEntry]) -> [ClipboardSession] {
+    enum DayPart: String {
+        case morning = "早上", afternoon = "下午", evening = "晚上"
+        static func at(_ date: Date, calendar: Calendar) -> DayPart {
+            switch calendar.component(.hour, from: date) {
+            case 0..<12: return .morning
+            case 12..<18: return .afternoon
+            default: return .evening
+            }
+        }
+    }
+
+    static func group(_ entries: [ClipboardEntry], now: Date = Date(), calendar: Calendar = .current) -> [ClipboardSession] {
         var batches: [[ClipboardEntry]] = []
         for entry in entries.sorted(by: { $0.captured > $1.captured }) {
             if let previous = batches.last?.last,
-               previous.captured.timeIntervalSince(entry.captured) <= 600 {
-                batches[batches.count - 1].append(entry)
-            } else {
-                batches.append([entry])
+               calendar.isDate(previous.captured, inSameDayAs: entry.captured) {
+                let today = calendar.isDate(entry.captured, inSameDayAs: now)
+                let joins = today ? previous.captured.timeIntervalSince(entry.captured) <= 600 :
+                    DayPart.at(previous.captured, calendar: calendar) == DayPart.at(entry.captured, calendar: calendar)
+                if joins { batches[batches.count - 1].append(entry); continue }
             }
+            batches.append([entry])
         }
         return batches.map { ClipboardSession(entries: $0) }
     }
 
-    var timeRange: String {
+    var timeRange: String { title() }
+    func title(now: Date = Date(), calendar: Calendar = .current) -> String {
         let first = entries[entries.count - 1].captured
         let last = entries[0].captured
-        let calendar = Calendar.current
-        let day = calendar.isDateInToday(first) ? "今天" :
-            calendar.isDateInYesterday(first) ? "昨天" :
-            first.formatted(.dateTime.month(.defaultDigits).day())
-        let start = first.formatted(date: .omitted, time: .shortened)
-        let end = calendar.isDate(first, inSameDayAs: last) ?
-            last.formatted(date: .omitted, time: .shortened) :
-            last.formatted(.dateTime.month(.defaultDigits).day().hour().minute())
+        let today = calendar.isDate(first, inSameDayAs: now)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: now).map {
+            calendar.isDate(first, inSameDayAs: $0)
+        } ?? false
+        let date = DateFormatter(); date.calendar = calendar; date.timeZone = calendar.timeZone
+        date.dateFormat = "M月d日"
+        let day = today ? "今天" : yesterday ? "昨天" : date.string(from: first)
+        if !today { return "\(day) · \(DayPart.at(first, calendar: calendar).rawValue)" }
+        let time = DateFormatter(); time.calendar = calendar; time.timeZone = calendar.timeZone
+        time.dateStyle = .none; time.timeStyle = .short
+        let start = time.string(from: first), end = time.string(from: last)
         return start == end ? "\(day) · \(start)" : "\(day) · \(start)–\(end)"
     }
+
 }
 
 enum ClipboardCopyFeedback: String, CaseIterable, Identifiable {
@@ -237,45 +345,39 @@ struct ClipboardHistoryView:View {
     @ObservedObject var store:ClipboardHistoryStore
     @ObservedObject var quickTexts: QuickTextLibrary
     @State private var saveDraft: SaveDraft?
-    @State private var savedEntries: [UUID: UUID] = [:]
-    @State private var copiedAction: (id: UUID, plainText: Bool)?
-    @State private var openedAction: UUID?
+    @Environment(\.openWindow) private var openWindow
+    @State private var copyStatus = ClipboardCopyStatus()
+    @State private var openedEntries=Set<UUID>()
+    @State private var savedFiles = Set<UUID>()
+    @State private var interactedIDs=Set<UUID>()
+    @State private var editingEntry:ClipboardEntry?
 
     private struct SaveDraft: Identifiable {
         let id: UUID
         let text: QuickText
+        var imageData: Data? = nil
     }
     @AppStorage("findduckClipboardCopyFeedback") private var copyFeedback = ClipboardCopyFeedback.center
     @State private var copied = ""
     @State private var copiedEntryID: UUID?
-    @State private var hovered:UUID?
-    @State private var hoveredGroup: UUID?
-    @State private var selected: UUID?
+    @State private var selectionInput = TextRowSelectionInput()
+    @State private var conditions = FilterCancellation<String>()
+    @State private var rowSelection = ClipboardRowSelection()
+    private var selected: UUID? {
+        get { rowSelection.selectedID }
+        nonmutating set { rowSelection.select(newValue) }
+    }
     @State private var copyFeedbackID: UUID?
     @FocusState private var listFocused: Bool
     @State private var query=""
     @State private var filter:ClipboardFilter = .all
-    @State private var period: HistoryPeriod = .all
-    @AppStorage("findduckClipboardSessionGrouping") private var groupBySession = false
-    @State private var expansion: [UUID: Bool] = [:]
+    @State private var period: ClipboardHistoryPeriod = .all
+    @State private var groupingDate = Date()
+    @State private var visibleCache = MemoizedValue<ClipboardListKey, [ClipboardEntry]>()
 
-    private struct VisibleSession: Identifiable {
-        let session: ClipboardSession
-        let entries: [ClipboardEntry]
-        let expanded: Bool
-        var id: UUID { session.id }
-    }
-
-    private func visibleSessions(matching entries: [ClipboardEntry]) -> [VisibleSession] {
-        let matchingIDs = Set(entries.map(\.id))
-        var groups: [VisibleSession] = []
-        for session in ClipboardSession.group(store.items) {
-            let matches = session.entries.filter { matchingIDs.contains($0.id) }
-            guard !matches.isEmpty else { continue }
-            let expanded = !query.isEmpty || (expansion[session.id] ?? groups.isEmpty)
-            groups.append(VisibleSession(session: session, entries: matches, expanded: expanded))
-        }
-        return groups
+    private func listKey(expansion: [UUID: Bool] = [:]) -> ClipboardListKey {
+        ClipboardListKey(revision: store.revision, query: query, filter: filter.rawValue,
+                         period: period.rawValue, day: Calendar.current.startOfDay(for: groupingDate), expansion: expansion)
     }
 
     private enum ClipboardFilter: String, CaseIterable, Identifiable {
@@ -283,89 +385,92 @@ struct ClipboardHistoryView:View {
         var id: String { rawValue }
     }
 
-    private enum HistoryPeriod: String, CaseIterable, Identifiable {
-        case all = "不限时间", today = "今天", yesterday = "昨天", week = "最近 7 天", month = "最近 30 天"
-        var id: String { rawValue }
-
-        func includes(_ date: Date, now: Date, calendar: Calendar) -> Bool {
-            switch self {
-            case .all: return true
-            case .today: return calendar.isDate(date, inSameDayAs: now)
-            case .yesterday: return calendar.isDateInYesterday(date)
-            case .week, .month:
-                let days = self == .week ? 7 : 30
-                let start = calendar.date(byAdding: .day, value: 1 - days, to: calendar.startOfDay(for: now))
-                return start.map { date >= $0 } ?? false
-            }
-        }
-    }
-
     private var visible: [ClipboardEntry] {
-        let now = Date()
-        let calendar = Calendar.current
-        return store.items.filter { entry in
-            guard period.includes(entry.captured, now: now, calendar: calendar) else { return false }
-            if !query.isEmpty {
-                let text = entry.text ?? entry.filePaths?.joined(separator: " ") ?? "图片"
-                if !text.localizedStandardContains(query) { return false }
-            }
-            return switch filter {
-            case .all: true
-            case .text: entry.kind == .text && entry.webURL == nil
-            case .links: entry.webURL != nil
-            case .images: entry.kind == .image
-            case .files: entry.kind == .file
-            case .favorites: entry.favorite == true
+        visibleCache.value(for: listKey()) {
+            let now = Date()
+            let calendar = Calendar.current
+            return store.items.filter { entry in
+                guard period.includes(entry.captured, now: now, calendar: calendar) else { return false }
+                if !query.isEmpty {
+                    let text = entry.text ?? entry.filePaths?.joined(separator: " ") ?? "图片"
+                    if !text.localizedStandardContains(query) { return false }
+                }
+                return switch filter {
+                case .all: true
+                case .text: entry.kind == .text && entry.webURL == nil
+                case .links: entry.webURL != nil
+                case .images: entry.kind == .image
+                case .files: entry.kind == .file
+                case .favorites: entry.favorite == true
+                }
             }
         }
     }
     var body: some View {
         let matches = visible
-        let groups = groupBySession ? visibleSessions(matching: matches) : []
-        let navigable = groupBySession ? groups.filter(\.expanded).flatMap(\.entries) : matches
+        let navigable = matches
         ScrollViewReader { proxy in
         VStack(alignment:.leading,spacing:10) {
             HStack(spacing:8) {
                 ForEach(ClipboardFilter.allCases) {option in Button {filter=option} label: {Text(option.rawValue).font(.system(size:11,weight:.medium)).padding(.horizontal,8).padding(.vertical,5).foregroundStyle(filter == option ? Color.accentColor : Color.primary).background(filter == option ? FindDuckHighlight.soft : Color.primary.opacity(0.05),in:Capsule())}.buttonStyle(.plain)}
                 Spacer(minLength:0)
-                TextField("搜索",text:$query).textFieldStyle(.roundedBorder).frame(minWidth:60, maxWidth:100)
+                InlineSearchField(prompt:"搜索",text:$query).frame(minWidth:80,maxWidth:120)
                 Menu {
-                    Toggle("按复制时段分组（测试）", isOn: $groupBySession)
-                    Divider()
-                    ForEach(HistoryPeriod.allCases) { option in
-                        Button {
-                            period = option
-                        } label: {
-                            if period == option { Label(option.rawValue, systemImage: "checkmark") }
-                            else { Text(option.rawValue) }
-                        }
-                    }
+                    Picker("时间筛选",selection:$period) {
+                        ForEach(ClipboardHistoryPeriod.allCases) {option in Text(option.rawValue).tag(option)}
+                    }.pickerStyle(.inline)
                 } label: {
-                    Image(systemName: "calendar").foregroundStyle(period == .all ? Color.secondary : Color.accentColor)
+                    if period == .all {Image(systemName:"calendar").foregroundStyle(.secondary)}
+                    else {Text(period.rawValue).foregroundStyle(Color.accentColor)}
                 }
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .accessibilityLabel("时间筛选")
+                .accessibilityValue(period.rawValue)
                 .help(period.rawValue)
             }
-            if matches.isEmpty {ContentUnavailableView(store.items.isEmpty ? "暂无剪贴板记录" : "这个分类暂无记录",systemImage:"doc.on.clipboard",description:Text("复制文字、链接、图片或文件后会出现在这里。")).frame(maxWidth: .infinity, maxHeight: .infinity)}
-            else { historyList(matches: matches, groups: groups) }
-            HStack {Text("↑↓ 选择 · 回车或双击复制 · 本机最多 1 GB").font(.caption).foregroundStyle(.secondary);Spacer();if !store.error.isEmpty {Text(store.error).font(.caption).foregroundStyle(.red)}}
+            if matches.isEmpty {ContentUnavailableView(store.items.isEmpty ? "暂无剪贴板记录" : "这个分类暂无记录",systemImage:"doc.on.clipboard",description:Text("拷贝文字、链接、图片或文件后会出现在这里。")).frame(maxWidth: .infinity, maxHeight: .infinity)}
+            else { historyList(matches: matches) }
+            HStack {Text("↑↓ 选择 · 回车或双击拷贝").font(.caption).foregroundStyle(.secondary);Spacer();if !store.error.isEmpty {Text(store.error).font(.caption).foregroundStyle(.red)}}
         }
         .sheet(item: $saveDraft) { draft in
-            QuickTextEditor(item: draft.text) { item in
-                guard quickTexts.save(item) else { return false }
-                savedEntries[draft.id] = item.id
-                return true
+            QuickTextEditor(item:draft.text,library:quickTexts,initialImageData:draft.imageData)
+        }
+        .sheet(item:$editingEntry) { entry in ClipboardTextEditor(entry:entry,store:store) }
+        .onAppear { groupingDate = Date() }
+        .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { date in
+            if !Calendar.current.isDate(date, inSameDayAs: groupingDate) {
+                groupingDate = date; selected = nil
             }
         }
-        .onChange(of: groupBySession) { selected = nil; expansion.removeAll() }
-        .onChange(of: query) { selected = nil }
-        .onChange(of: filter) { selected = nil; listFocused = true }
-        .onChange(of: period) { selected = nil }
+        .onChange(of: store.revision) { rowSelection.retain(Set(store.items.map(\.id))) }
+        .background(TextListKeyboard(requestDelete:{
+            guard let id=selected else {return false};rowSelection.setConfirmation(true,for:id);return true
+        },confirmDelete:{
+            guard let id=rowSelection.confirmingID,let entry=store.items.first(where:{$0.id == id}) else {return false}
+            rowSelection.setConfirmation(false,for:id);store.remove(entry);return true
+        }))
+        .onChange(of: query) { selected = nil; conditions.record("query", active: !query.isEmpty) }
+        .onChange(of: filter) { selected = nil; listFocused = true; conditions.record("filter", active: filter != .all) }
+        .onChange(of: period) { selected = nil; conditions.record("period", active: period != .all) }
         .onExitCommand {
-            selected = nil
-            NSApp.keyWindow?.orderOut(nil)
+            if let id = rowSelection.confirmingID {
+                rowSelection.setConfirmation(false, for: id)
+                return
+            }
+            if let condition = conditions.pop() {
+                switch condition {
+                case "query": query = ""
+                case "filter": filter = .all
+                default: period = .all
+                }
+            } else { selected = nil; NSApp.keyWindow?.orderOut(nil) }
+        }
+        .onReceive(Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()) { _ in
+            if copyStatus.invalidateIfChanged(NSPasteboard.general.changeCount) {
+                copiedEntryID = nil
+                copyFeedbackID = nil
+            }
         }
         .onChange(of: copyFeedback) { copiedEntryID = nil; copyFeedbackID = nil }
         .task(id: copyFeedbackID) {
@@ -374,66 +479,35 @@ struct ClipboardHistoryView:View {
             catch { return }
             withAnimation(.easeOut(duration: 0.16)) { copiedEntryID = nil }
         }
+            .onKeyPress(keys:[.delete,.deleteForward],phases:.down) { _ in
+                guard let id=selected else {return .ignored};rowSelection.setConfirmation(true,for:id);return .handled
+            }
+            .onKeyPress(.space,phases:.down) { _ in
+                guard let id=rowSelection.confirmingID,let entry=store.items.first(where:{$0.id == id}) else {return .ignored}
+                rowSelection.setConfirmation(false,for:id);store.remove(entry);return .handled
+            }
             .onKeyPress(.downArrow) { moveSelection(1, entries: navigable, proxy: proxy) }
             .onKeyPress(.upArrow) { moveSelection(-1, entries: navigable, proxy: proxy) }
             .onKeyPress(.return, phases: .down) { _ in
+                if let id=rowSelection.confirmingID,let entry=store.items.first(where:{$0.id == id}) {rowSelection.setConfirmation(false,for:id);store.remove(entry);return .handled}
                 guard let entry = navigable.first(where: { $0.id == selected }) else { return .ignored }
                 copy(entry, keepSelection: true)
                 return .handled
             }
         }
     }
-    private func historyList(matches: [ClipboardEntry], groups: [VisibleSession]) -> some View {
-        List {
-            if groupBySession {
-                ForEach(groups) { group in
-                    Button {
-                        expansion[group.id] = !group.expanded
-                        if group.entries.contains(where: { $0.id == selected }) { selected = nil }
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: group.expanded ? "chevron.down" : "chevron.right")
-                            Text(group.session.timeRange).font(.system(size: 13, weight: .semibold)).foregroundStyle(.primary)
-                            Spacer()
-                            Text("\(group.entries.count) 条")
-                                .monospacedDigit()
-                                .padding(.horizontal, 7).padding(.vertical, 2)
-                                .background(Color.primary.opacity(0.06), in: Capsule())
-                        }
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.secondary)
-                        .padding(.horizontal, 9).padding(.vertical, 7)
-                        .background(hoveredGroup == group.id ? FindDuckHighlight.hover : .clear, in: RoundedRectangle(cornerRadius: 8))
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .onHover { hoveredGroup = $0 ? group.id : nil }
-                    .disabled(!query.isEmpty)
-                    .accessibilityLabel("\(group.session.timeRange)，\(group.entries.count) 条")
-                    .accessibilityValue(group.expanded ? "已展开" : "已折叠")
-                    .listRowSeparator(.hidden)
-                    .listRowBackground(Color.clear)
-                    if group.expanded { historyRows(group.entries) }
-                }
-            } else {
-                historyRows(matches)
-            }
-        }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
-        .focusable()
-        .focusEffectDisabled()
-        .focused($listFocused)
-        .defaultFocus($listFocused, true)
+    private func historyList(matches: [ClipboardEntry]) -> some View {
+        List {historyRows(matches)}
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .focusable().focusEffectDisabled().focused($listFocused).defaultFocus($listFocused,true)
     }
 
     private func historyRows(_ entries: [ClipboardEntry]) -> some View {
         ForEach(Array(entries.enumerated()), id: \.element.id) { number, entry in
-            historyRow(entry, number: number + 1)
-                .accessibilityAddTraits(selected == entry.id ? .isSelected : [])
-                .contentShape(Rectangle())
-                .background((selected == entry.id || hovered == entry.id) ? FindDuckHighlight.selected : .clear,
-                            in: RoundedRectangle(cornerRadius: 11))
+            ClipboardSelectableRow(flag: rowSelection.flag(for: entry.id)) { isSelected in
+                historyRow(entry, number: number + 1, isSelected: isSelected)
+            }
                 .overlay {
                     if copyFeedback == .center, copiedEntryID == entry.id {
                         copyIndicator
@@ -442,8 +516,13 @@ struct ClipboardHistoryView:View {
                             .allowsHitTesting(false)
                     }
                 }
-                .onHover { hovered = $0 ? entry.id : nil }
-                .onTapGesture(count: 2) { copy(entry) }
+                .onContinuousHover { phase in
+                    if case .active = phase, selectionInput.acceptsPointer(at: NSEvent.mouseLocation), selected != entry.id {
+                        selected = entry.id
+                    }
+                }
+                .onTapGesture(count: 2) { selectionInput.usePointer(); selected = entry.id; copy(entry, keepSelection: true) }
+                .onTapGesture { selectionInput.usePointer(); selected = entry.id; focusList() }
                 .overlay(alignment: .bottom) {
                     Rectangle().fill(Color.primary.opacity(0.09)).frame(height: 1)
                         .padding(.horizontal, 8).allowsHitTesting(false)
@@ -455,7 +534,9 @@ struct ClipboardHistoryView:View {
     }
 
     private func moveSelection(_ offset: Int, entries: [ClipboardEntry], proxy: ScrollViewProxy) -> KeyPress.Result {
+        guard rowSelection.confirmingID == nil else { return .handled }
         guard !entries.isEmpty else { return .ignored }
+        selectionInput.useKeyboard(at: NSEvent.mouseLocation)
         let current = entries.firstIndex { $0.id == selected }
         let index = current.map { min(max($0 + offset, 0), entries.count - 1) }
             ?? (offset < 0 ? entries.count - 1 : 0)
@@ -466,30 +547,33 @@ struct ClipboardHistoryView:View {
         return .handled
     }
 
-    private func historyRow(_ entry: ClipboardEntry, number: Int) -> some View {
+    private func historyRow(_ entry: ClipboardEntry, number: Int, isSelected: Bool) -> some View {
         let isLink = entry.webURL != nil
         let title = entry.kind == .image ? "图片" : entry.kind == .file ? "文件" : isLink ? "链接" : "文本"
         let symbol = entry.kind == .image ? "photo" : entry.kind == .file ? "doc" : isLink ? "link" : "text.alignleft"
-        return HStack(alignment: .top, spacing: 12) {
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .top, spacing: 12) {
             Text(number.formatted())
                 .monospacedDigit()
                 .foregroundStyle(Color(red: 8.0 / 255, green: 88.0 / 255, blue: 240.0 / 255))
                 .frame(minWidth: 24, alignment: .leading)
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     if let bundleID = entry.sourceBundleID,
-                       let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-                        Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                       let icon = ClipboardVisualAssets.shared.applicationIcon(bundleID) {
+                        Image(nsImage: icon)
                             .resizable().scaledToFit().frame(width: 16, height: 16)
-                            .help(appURL.deletingPathExtension().lastPathComponent)
+                            .help(bundleID)
                     } else {
                         Image(systemName: symbol).foregroundStyle(.secondary)
                     }
                     Text(title)
-                    if let detail = metadata(entry) {
+                    if entry.kind == .image, let url = store.imageURL(for: entry) {
+                        ClipboardImageSize(url: url)
+                    } else if let detail = metadata(entry) {
                         Text(detail).foregroundStyle(.secondary)
                     }
-                    Text(Calendar.current.isDateInToday(entry.captured) ? "今天 " + entry.captured.formatted(date: .omitted, time: .shortened) : entry.captured.formatted(.dateTime.month(.defaultDigits).day().hour().minute()))
+                    Text(ClipboardDate.text(entry.captured))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Spacer(minLength: 0)
@@ -497,144 +581,235 @@ struct ClipboardHistoryView:View {
                 .font(.system(size: 12))
                 Group {
                     if entry.kind == .image {
-                        if let url = store.imageURL(for: entry), let picture = NSImage(contentsOf: url) {
-                            Image(nsImage: picture)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(maxWidth: 320, maxHeight: 88, alignment: .leading)
+                        if let url = store.imageURL(for: entry) {
+                            ClipboardImagePreview(url: url)
                         } else {
                             Text("图片预览不可用").foregroundStyle(.secondary)
                         }
                     } else if entry.kind == .file {
-                        ForEach(Array((entry.filePaths ?? []).prefix(3).enumerated()), id: \.offset) { _, path in
-                            let url = URL(fileURLWithPath: path)
-                            HStack(spacing: 8) {
-                                Image(nsImage: NSWorkspace.shared.icon(forFile: path))
-                                    .resizable().scaledToFit().frame(width: 24, height: 24)
-                                Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array((entry.filePaths ?? []).prefix(3).enumerated()), id: \.offset) { _, path in
+                                let url = URL(fileURLWithPath: path)
+                                HStack(spacing: 8) {
+                                    Image(nsImage: ClipboardVisualAssets.shared.fileIcon(path))
+                                        .resizable().scaledToFit().frame(width: 18, height: 18)
+                                    Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                                }
+                                .help(path)
                             }
-                            .help(path)
                         }
                     } else {
                         Text(entry.text ?? "")
                             .font(.system(size: 13))
                             .foregroundStyle(isLink ? Color.accentColor : Color.primary)
-                            .lineLimit(4)
+                            .lineLimit(3)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                .frame(maxHeight: 88, alignment: .topLeading)
+                .frame(maxHeight: 64, alignment: .topLeading)
                 .clipped()
 
-                Spacer(minLength: 0)
-                if selected == entry.id || hovered == entry.id {
-                    actionBar(entry)
-                } else {
-                    Color.clear.frame(height: 24).accessibilityHidden(true)
-                }
             }
+            }
+            Spacer(minLength: 0)
+            actionBar(entry, expanded: isSelected)
         }
         .padding(8)
-        .frame(height: 160, alignment: .topLeading)
+        .frame(height: 132, alignment: .topLeading)
         .clipped()
-        .contextMenu {
-            Button("删除这条记录", role: .destructive) { store.remove(entry) }
-        }
+
     }
 
-    private func actionBar(_ entry: ClipboardEntry) -> some View {
-        let copied = copiedAction?.id == entry.id && copiedAction?.plainText == false
-        let plainCopied = copiedAction?.id == entry.id && copiedAction?.plainText == true
+    private func actionBar(_ entry: ClipboardEntry, expanded: Bool) -> some View {
+        let copied = copyStatus.isActive(entry.id,plainText:false)
+        let plainCopied = copyStatus.isActive(entry.id,plainText:true)
         let favorite = entry.favorite == true
-        let saved = quickTexts.items.contains { $0.id == savedEntries[entry.id] }
+        let favoriteGold = Color(red: 0.91, green: 0.64, blue: 0.04)
+        let linkedText = quickTexts.item(fromClipboard: entry.id)
+        let saved = linkedText != nil
+        let visible=expanded || interactedIDs.contains(entry.id) || copied || plainCopied || favorite || saved || savedFiles.contains(entry.id) || openedEntries.contains(entry.id)
         return HStack(spacing: 5) {
-            rowAction(copied ? "已复制" : "复制", active: copied, checkmark: copied && copyFeedback == .icon) { copy(entry, keepSelection: true) }
+            if visible || copied {
+                rowAction("拷贝", symbol: copied ? "checkmark" : "doc.on.doc", active: copied, preserveTitle: true) { copy(entry, keepSelection: true) }
+            }
             if let text = entry.text {
-                if entry.webURL == nil {
-                    rowAction(plainCopied ? "已转纯文本" : "纯文本", active: plainCopied, checkmark: plainCopied && copyFeedback == .icon) {
+                if entry.webURL == nil && (visible || plainCopied) {
+                    rowAction("纯文本", symbol: plainCopied ? "checkmark" : "t.square", active: plainCopied, preserveTitle: true) {
                         copy(entry, plainText: true, keepSelection: true)
                     }
                 }
-                rowAction(saved ? "已保存" : "存为快捷文本", active: saved) {
-                    let title = String((text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text).prefix(24))
-                    saveDraft = SaveDraft(id: entry.id, text: QuickText(title: title, text: text))
+                if visible || saved {
+                    rowAction("加入常用文本…", symbol: saved ? "checkmark" : "text.badge.plus", active: saved, goldStatus: true) {
+                        if let linkedText {
+                            quickTexts.revealID = linkedText.id
+                            openWindow(id: "quick-text")
+                            return
+                        }
+                        let title = String((text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text).prefix(24))
+                        saveDraft = SaveDraft(id: entry.id, text: QuickText(title: title, text: text, sourceClipboardID: entry.id))
+                    }
                 }
             }
-            rowAction(favorite ? "已收藏" : "收藏", active: favorite) { store.toggleFavorite(entry) }
-                .help(favorite ? "取消收藏" : "收藏")
-            if let target = entry.webURL {
-                rowAction(openedAction == entry.id ? "已打开" : "打开", active: openedAction == entry.id) {
-                    if NSWorkspace.shared.open(target) { openedAction = entry.id }
+            if entry.kind == .image && (visible || saved) {
+                rowAction("加入常用文本…",symbol:saved ? "checkmark" : "text.badge.plus",active:saved,goldStatus:true) {
+                    if let linkedText {quickTexts.revealID=linkedText.id;openWindow(id:"quick-text");return}
+                    guard let url=store.imageURL(for:entry),let data=try? Data(contentsOf:url) else {return}
+                    saveDraft=SaveDraft(id:entry.id,text:QuickText(title:"剪贴板图片",text:"",sourceClipboardID:entry.id),imageData:data)
                 }
-            } else if let text = entry.text {
-                rowAction(openedAction == entry.id ? "已搜索" : "搜索", active: openedAction == entry.id) {
-                    var url = URLComponents(string: "https://www.google.com/search")
-                    url?.queryItems = [URLQueryItem(name: "q", value: text)]
-                    if let target = url?.url, NSWorkspace.shared.open(target) { openedAction = entry.id }
+            }
+            if entry.kind != .text && (visible || savedFiles.contains(entry.id)) {
+                rowAction("另存为…",
+                          symbol: savedFiles.contains(entry.id) ? "checkmark" : "square.and.arrow.down",
+                          active: savedFiles.contains(entry.id)) { saveAs(entry) }
+            }
+            if visible {
+                if let target=entry.webURL {
+                    rowAction("打开",symbol:"link",active:openedEntries.contains(entry.id)) {
+                        if NSWorkspace.shared.open(target) {openedEntries.insert(entry.id)}
+                    }
                 }
-                .help("用浏览器搜索")
+                if entry.kind == .text {
+                    rowAction("编辑",symbol:"square.and.pencil",active:false) {editingEntry=entry}
+                }
+            }
+            if visible || favorite {
+                Button { focusList();store.toggleFavorite(entry) } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: favorite ? "star.fill" : "star")
+                            .foregroundStyle(favorite ? favoriteGold : Color.secondary)
+                        Text("收藏")
+                            .foregroundStyle(Color.primary)
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 6).frame(height: 24)
+                    .background(favorite ? favoriteGold.opacity(0.18) : Color.primary.opacity(0.06),
+                                in: RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain).modifier(ActionHover())
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(1)
+                .accessibilityLabel(favorite ? "取消收藏" : "收藏")
+                .accessibilityValue(favorite ? "已收藏" : "未收藏")
+                .help(favorite ? "取消收藏" : "收藏这条记录")
             }
             Spacer(minLength: 0)
-            Button(role: .destructive) { store.remove(entry) } label: {
-                Image(systemName: "trash").frame(width: 28, height: 24)
-                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+            if visible {
+                ConfirmDeleteButton(isPresented: Binding(
+                    get: { rowSelection.flag(for: entry.id).deleteConfirmation },
+                    set: { rowSelection.setConfirmation($0, for: entry.id) }),
+                    delete: { store.remove(entry) }) {
+                    Image(systemName: "trash").frame(width: 28, height: 24)
+                        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain).modifier(ActionHover())
+                .foregroundStyle(Color.red)
+                .layoutPriority(1)
+                .accessibilityLabel("删除")
+                .help("删除这条记录")
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color.red)
-            .layoutPriority(1)
-            .accessibilityLabel("删除")
-            .help("删除这条记录")
         }
         .frame(height: 24)
     }
 
-    private func rowAction(_ title: String, active: Bool, checkmark: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    private func focusList() {
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        listFocused=true
+    }
+
+    private func rowAction(_ title: String, symbol: String, active: Bool, preserveTitle: Bool = false, goldStatus: Bool = false, action: @escaping () -> Void) -> some View {
+        let statusColor = goldStatus ? Color(red: 0.91, green: 0.64, blue: 0.04) : Color.blue
+        return Button {focusList();action()} label: {
             HStack(spacing: 3) {
-                if checkmark { Image(systemName: "checkmark") }
+                if active && symbol == "checkmark" {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 9, weight: .heavy))
+                        .foregroundStyle(.white)
+                        .frame(width: 15, height: 15)
+                        .background(Color(red: 0.12, green: 0.62, blue: 0.30), in: Circle())
+                } else {
+                    Image(systemName: symbol).frame(width: 15)
+                }
                 Text(title)
             }
                 .font(.system(size: 11, weight: active ? .semibold : .medium))
                 .lineLimit(1)
                 .padding(.horizontal, 6)
                 .frame(height: 24)
-                .foregroundStyle(active ? Color.accentColor : Color.primary)
-                .background(active ? FindDuckHighlight.soft : Color.primary.opacity(0.06),
+                .foregroundStyle(active && !goldStatus ? Color.blue : Color.primary)
+                .background(active ? statusColor.opacity(goldStatus ? 0.18 : 0.14) : Color.primary.opacity(0.06),
                             in: RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
+        .fixedSize(horizontal: active && preserveTitle, vertical: false)
+        .layoutPriority(active && preserveTitle ? 3 : active ? 1 : 0)
+        .modifier(ActionHover())
+        .help(title)
+        .accessibilityLabel(title)
+    }
+
+    private func saveAs(_ entry: ClipboardEntry) {
+        let sources = store.saveSourceURLs(for: entry)
+        guard !sources.isEmpty else { store.error = "这条记录无法另存为"; return }
+        do {
+            if sources.count == 1 {
+                let panel = NSSavePanel()
+                if entry.kind == .image {
+                    let formatter = DateFormatter()
+                    formatter.locale = Locale(identifier: "en_US_POSIX")
+                    formatter.calendar = Calendar(identifier: .gregorian)
+                    formatter.timeZone = .current
+                    formatter.dateFormat = "yyyyMMdd_HHmmss"
+                    panel.nameFieldStringValue = "剪贴板图片_\(formatter.string(from: Date())).png"
+                } else {
+                    panel.nameFieldStringValue = sources[0].lastPathComponent
+                }
+                if entry.kind == .image { panel.allowedContentTypes = [.png] }
+                panel.prompt = "另存为"
+                guard panel.runModal() == .OK, let destination = panel.url else { return }
+                try store.save(entry, to: destination)
+            } else {
+                let panel = NSOpenPanel()
+                panel.canChooseDirectories = true
+                panel.canChooseFiles = false
+                panel.allowsMultipleSelection = false
+                panel.prompt = "保存到这里"
+                guard panel.runModal() == .OK, let directory = panel.url else { return }
+                try store.saveFiles(entry, into: directory)
+            }
+            store.error = ""
+            savedFiles.insert(entry.id)
+        } catch {
+            store.error = "另存为失败：" + error.localizedDescription
+        }
     }
 
     private var copyIndicator: some View {
         Text(copied)
             .font(.callout.weight(.semibold))
-            .foregroundStyle(Color.accentColor)
+            .foregroundStyle(Color.blue)
             .padding(.horizontal, 11)
             .padding(.vertical, 5)
-            .background(FindDuckHighlight.soft, in: Capsule())
+            .background(Color.blue.opacity(0.14), in: Capsule())
             .background(Color(nsColor: .windowBackgroundColor), in: Capsule())
     }
 
     private func copy(_ entry: ClipboardEntry, plainText: Bool = false, keepSelection: Bool = false) {
         guard store.copy(entry, plainText: plainText) else {
-            store.error = "复制失败，原记录可能已不可用"
+            store.error = "拷贝失败，原记录可能已不可用"
             return
         }
         store.error = ""
-        if !keepSelection { selected = nil }
-        copiedAction = (entry.id, plainText)
-        copied = plainText ? "已复制为纯文本" : "已复制"
+        selected = keepSelection ? entry.id : nil
+        interactedIDs.insert(entry.id)
+        copyStatus = ClipboardCopyStatus(entryID: entry.id, plainText: plainText, changeCount: NSPasteboard.general.changeCount)
+        copied = plainText ? "已拷贝纯文本" : "已拷贝"
         withAnimation(copyFeedback == .center ? .easeOut(duration: 0.16) : nil) { copiedEntryID = entry.id }
         copyFeedbackID = UUID()
     }
 
     private func metadata(_ entry: ClipboardEntry) -> String? {
-        if entry.kind == .image, let url = store.imageURL(for: entry),
-           let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize {
-            return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-        }
         if entry.kind == .file, let paths = entry.filePaths { return "\(paths.count) 个文件" }
-        return entry.text.map { "\($0.count) 个字符" }
+        return nil
     }
 
 }

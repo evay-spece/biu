@@ -69,7 +69,7 @@ private let callback: EventHandlerUPP = { _, event, context in
         switch purpose {
         case .search, .secondarySearch: "搜索"
         case .clipboard: "剪贴板"
-        case .quickText: "快捷文本"
+        case .quickText: "常用文本"
         }
     }
     @Published private(set) var settings: HotKeySettings

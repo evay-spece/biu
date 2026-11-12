@@ -143,7 +143,7 @@ enum DuckDeepSearch {
                     for case let url as URL in e {
                         if Task<Never,Never>.isCancelled {return(found,errors)}
                         if exclusions.contains(url) {e.skipDescendants();continue}
-                        if url.lastPathComponent.localizedStandardContains(term),let v=try? url.resourceValues(forKeys:[.isRegularFileKey,.contentModificationDateKey]),v.isRegularFile == true {found.append(FileHit(url:url,modified:v.contentModificationDate))}
+                        if SearchText.contains(url.lastPathComponent,term),let v=try? url.resourceValues(forKeys:[.isRegularFileKey,.contentModificationDateKey]),v.isRegularFile == true {found.append(FileHit(url:url,modified:v.contentModificationDate))}
                     }
                 };return(found,errors)
 
@@ -153,6 +153,7 @@ enum DuckDeepSearch {
 // App-only annotations: never write Finder tags or extended attributes.
 enum FileMarkColor:String,Codable,CaseIterable,Sendable,Identifiable {
  case red="红色",orange="橙色",yellow="黄色",green="绿色",blue="蓝色",purple="紫色",gray="灰色"
+ static let palette: [FileMarkColor] = [.red, .yellow, .green, .blue, .purple]
  var id:String {rawValue}
  var color:Color {switch self {case .red:.red;case .orange:.orange;case .yellow:.yellow;case .green:.green;case .blue:.blue;case .purple:.purple;case .gray:.gray}}
  func tagBackground(highlighted:Bool=false)->Color {let native=NSColor(color);return Color(nsColor:native.blended(withFraction:highlighted ? 0.68 : 0.80,of:.textBackgroundColor) ?? native)}

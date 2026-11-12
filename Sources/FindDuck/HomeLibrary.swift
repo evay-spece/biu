@@ -13,24 +13,53 @@ struct HomeShortcut:Codable,Identifiable,Equatable,Sendable {
     var title:String
     var kind:HomeKind
     var target:String
-    var group:Int {switch kind {case .application:0;case .website:1;case .folder,.file:3;case .action:2}}
+    var customTitle:Bool? = nil
+    static let recentAppsTarget="biu:recent-apps"
+    static let applicationsTarget="biu:applications"
+    var isLauncher:Bool {kind == .action && [Self.recentAppsTarget,Self.applicationsTarget].contains(target)}
+    var group:Int {if isLauncher {return 0};return switch kind {case .application:0;case .website:1;case .folder,.file:3;case .action:2}}
 }
 @MainActor final class HomeLibrary:ObservableObject {
-    private struct Settings:Codable {var items:[HomeShortcut];var resumeWindowSeconds:Double?}
+    private struct Settings:Codable {var items:[HomeShortcut];var resumeWindowSeconds:Double?;var builtinLaunchersAdded:Bool?}
     @Published private(set) var items:[HomeShortcut]=[]
     @Published var resumeWindowSeconds:Double=120 {didSet {save()}}
     @Published private(set) var error=""
     private let storage:URL
-    init(storage:URL?=nil,seedDefaults:Bool=true) {
+    private let history:UserActionHistory
+    init(storage:URL?=nil,seedDefaults:Bool=true,history:UserActionHistory?=nil) {
+        self.history=history ?? .shared
         self.storage=storage ?? BiuStorage.directory.appendingPathComponent("home-shortcuts.json")
-        if let data=try? Data(contentsOf:self.storage),let settings=try? JSONDecoder().decode(Settings.self,from:data) {items=settings.items;resumeWindowSeconds=settings.resumeWindowSeconds ?? 120}
+        if let data=try? Data(contentsOf:self.storage),let settings=try? JSONDecoder().decode(Settings.self,from:data) {items=settings.items;resumeWindowSeconds=settings.resumeWindowSeconds ?? 120
+            if seedDefaults && settings.builtinLaunchersAdded != true {addBuiltinLaunchers();save()}
+            let normalized=items.filter {$0.target != HomeShortcut.recentAppsTarget}.map {item in
+                var item=item;if item.target == HomeShortcut.applicationsTarget {item.title="所有程序"};return normalizedApplication(item)
+            }
+            if normalized != items {items=normalized;save()}
+        }
         else if seedDefaults {
             for (bundle,name) in [("com.apple.finder","访达"),("com.tencent.xinWeChat","微信"),("com.microsoft.Excel","Excel"),("com.microsoft.edgemac","Edge"),("com.apple.Notes","备忘录"),("com.apple.Safari","Safari")] {
-                if let url=NSWorkspace.shared.urlForApplication(withBundleIdentifier:bundle) {items.append(HomeShortcut(title:name,kind:.application,target:url.path))}
+                if let url=NSWorkspace.shared.urlForApplication(withBundleIdentifier:bundle) {items.append(HomeShortcut(title:name,kind:.application,target:url.path,customTitle:false))}
             }
             for (title,address) in [("百度","https://www.baidu.com/"),("京东","https://www.jd.com/"),("天猫","https://www.tmall.com/")] {items.append(HomeShortcut(title:title,kind:.website,target:address))}
             for action in [HomeAction.downloads,.wechat,.recent,.settings] {items.append(HomeShortcut(title:action.rawValue,kind:.action,target:action.rawValue))}
-            save()
+            addBuiltinLaunchers();items=items.map(normalizedApplication);save()
+        }
+    }
+    private func normalizedApplication(_ item:HomeShortcut)->HomeShortcut {
+        let url=URL(fileURLWithPath:item.target)
+        guard item.kind == .application || ([HomeKind.file,.folder].contains(item.kind) && OilQueryEngine.isLaunchableApplication(url)) else {return item}
+        var result=item;result.kind = .application
+        let names=ApplicationNames.read(url)
+        func withoutExtension(_ name:String)->String {name.lowercased().hasSuffix(".app") ? String(name.dropLast(4)) : name}
+        let generated=names.aliases.contains {SearchText.fold(withoutExtension($0)) == SearchText.fold(withoutExtension(item.title))}
+        if item.customTitle == false || (item.customTitle == nil && generated) {
+            result.title=withoutExtension(names.displayName);result.customTitle=false
+        }
+        return result
+    }
+    private func addBuiltinLaunchers() {
+        for (title,target) in [("所有程序",HomeShortcut.applicationsTarget)] {
+            if !items.contains(where:{$0.target == target}) {items.append(HomeShortcut(title:title,kind:.action,target:target))}
         }
     }
     nonisolated static func shouldShowHome(elapsed:TimeInterval?,resumeWindow:TimeInterval)->Bool {elapsed == nil || elapsed! > resumeWindow}
@@ -46,10 +75,16 @@ struct HomeShortcut:Codable,Identifiable,Equatable,Sendable {
         if kind == .website {
             guard let url=Self.websiteURL(target) else {error="请输入有效的 http 或 https 网址，不包含账户密码。";return false};value=url.absoluteString
         }
-        guard !items.contains(where:{$0.kind == kind && $0.target == value}) else {error="这个入口已经在主页中。";return false}
         let title=title.trimmingCharacters(in:.whitespacesAndNewlines)
         guard !title.isEmpty else {error="请填写入口名称。";return false}
-        items.append(HomeShortcut(title:title,kind:kind,target:value));error="";save();return true
+        var item=HomeShortcut(title:title,kind:kind,target:value)
+        if kind == .application || ([HomeKind.file,.folder].contains(kind) && OilQueryEngine.isLaunchableApplication(URL(fileURLWithPath:value))) {item.customTitle=false}
+        item=normalizedApplication(item)
+        guard !items.contains(where:{$0.kind == item.kind && $0.target == value}) else {error="这个入口已经在主页中。";return false}
+        items.append(item);error="";save()
+        let id=item.id
+        history.record("添加首页入口") { [weak self] in guard let self else {return false};self.items.removeAll {$0.id == id};self.save();return self.error.isEmpty }
+        return true
     }
     @discardableResult func pin(_ url:URL)->Bool {
         guard url.isFileURL else {error="只能固定本机或已挂载磁盘的文件。";return false}
@@ -61,7 +96,7 @@ struct HomeShortcut:Codable,Identifiable,Equatable,Sendable {
     func remove(_ item:HomeShortcut) {items.removeAll {$0.id == item.id};save()}
     func rename(_ item:HomeShortcut,title:String) {
         guard let index=items.firstIndex(where:{$0.id == item.id}),!title.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty else {return}
-        items[index].title=title.trimmingCharacters(in:.whitespacesAndNewlines);save()
+        items[index].title=title.trimmingCharacters(in:.whitespacesAndNewlines);items[index].customTitle=true;save()
     }
     func move(_ item:HomeShortcut,by delta:Int) {
         let peers=items.indices.filter {items[$0].group == item.group}
@@ -80,6 +115,6 @@ struct HomeShortcut:Codable,Identifiable,Equatable,Sendable {
         items=items.map {item in item.group == group ? lookup[iterator.next()!]! : item};save()
     }
     private func save() {
-        do {try FileManager.default.createDirectory(at:storage.deletingLastPathComponent(),withIntermediateDirectories:true);try JSONEncoder().encode(Settings(items:items,resumeWindowSeconds:resumeWindowSeconds)).write(to:storage,options:.atomic)} catch {self.error="主页设置保存失败：\(error.localizedDescription)"}
+        do {try FileManager.default.createDirectory(at:storage.deletingLastPathComponent(),withIntermediateDirectories:true);try JSONEncoder().encode(Settings(items:items,resumeWindowSeconds:resumeWindowSeconds,builtinLaunchersAdded:true)).write(to:storage,options:.atomic)} catch {self.error="主页设置保存失败：\(error.localizedDescription)"}
     }
 }

@@ -23,7 +23,7 @@ struct FileTagEditor:View {
         VStack(alignment:.leading,spacing:14) {
             Text("文件标签").font(.system(size:12,weight:.semibold)).foregroundStyle(.secondary)
             HStack(spacing:10) {
-                ForEach(FileTag.defaults.filter {$0.color != .blue}) {tag in
+                ForEach(FileMarkColor.palette.map(FileTag.builtin)) {tag in
                     Button {model.toggleTag(file,tag)} label: {
                         HStack(spacing: 3) {
                             if model.hasTag(file,tag) { Image(systemName: "checkmark").font(.caption2) }
@@ -49,7 +49,7 @@ struct FileTagEditor:View {
     private let colors:[FileMarkColor]
     private let selected:()->Set<FileMarkColor>
     private let toggle:(FileMarkColor)->Void
-    init(colors:[FileMarkColor]=FileMarkColor.allCases.filter {$0 != .blue},selected:@escaping ()->Set<FileMarkColor>,toggle:@escaping (FileMarkColor)->Void) {
+    init(colors:[FileMarkColor]=FileMarkColor.palette,selected:@escaping ()->Set<FileMarkColor>,toggle:@escaping (FileMarkColor)->Void) {
         self.colors=colors;self.selected=selected;self.toggle=toggle;super.init(frame:NSRect(x:0,y:0,width:280,height:36))
         setAccessibilityElement(false)
         for (index,color) in colors.enumerated() {

@@ -2,7 +2,7 @@
 from pathlib import Path
 import os,sys,subprocess,plistlib,shutil,tempfile
 root=Path(__file__).resolve().parent
-app=Path(sys.argv[1]).resolve() if len(sys.argv)>1 else root/'build/Biu 1.4.34.app'
+app=Path(sys.argv[1]).resolve() if len(sys.argv)>1 else root/'build/Biu 1.5.6.app'
 if app.exists():raise SystemExit(f'目标已存在：{app}')
 env=os.environ.copy();env['DEVELOPER_DIR']='/Applications/Xcode.app/Contents/Developer'
 subprocess.run(['xcrun','swift','build','-c','release','--product','SMBSearch','--package-path',str(root)],env=env,check=True)
@@ -10,7 +10,7 @@ binpath=Path(subprocess.check_output(['xcrun','swift','build','-c','release','--
 app.parent.mkdir(parents=True,exist_ok=True)
 with tempfile.TemporaryDirectory(prefix='.findduck-oil-build-',dir=app.parent) as temp:
  stage=Path(temp)/app.name;(stage/'Contents/MacOS').mkdir(parents=True);(stage/'Contents/Resources').mkdir()
- info=plistlib.loads((root/'Info.plist').read_bytes());info.update(CFBundleShortVersionString='1.4.34',CFBundleVersion='96',CFBundleName='Biu',CFBundleDisplayName='Biu',LSMinimumSystemVersion='14.0')
+ info=plistlib.loads((root/'Info.plist').read_bytes());info.update(CFBundleShortVersionString='1.5.6',CFBundleVersion='151',CFBundleName='Biu',CFBundleDisplayName='Biu',LSMinimumSystemVersion='14.0')
  resources = stage / 'Contents/Resources'
  icon_plist = Path(temp) / 'icon-info.plist'
  subprocess.run(['xcrun', 'actool', '--compile', str(resources), '--platform', 'macosx',

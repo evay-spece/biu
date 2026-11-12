@@ -22,10 +22,6 @@ struct HomePanel:View {
         ScrollView {
             VStack(alignment:.leading,spacing:14) {
                 HStack {
-                    VStack(alignment:.leading,spacing:4) {
-                        Text("常用").font(.system(size:22,weight:.semibold))
-                        Text("软件、网站和个人快捷功能").font(.system(size:12)).foregroundStyle(.secondary)
-                    }
                     Spacer()
                     Menu {
                         Button("添加软件…") {choose(.application)}
@@ -35,10 +31,10 @@ struct HomePanel:View {
                     } label: {Label("添加入口",systemImage:"plus")}.menuStyle(.borderlessButton).fixedSize().accessibilityLabel("添加主页入口")
                 }
                 HStack(spacing:12) {
-                    Button {openWindow(id:"quick-text")} label: {Label("快捷文本",systemImage:"text.quote")}
+                    Button {openWindow(id:"quick-text")} label: {Label("常用文本",systemImage:"text.quote")}
+                    Button {openWindow(id:"clipboard")} label: {Label("剪贴板历史",systemImage:"doc.on.clipboard")}
                     Button {tool = .rates} label: {Label("人民币汇率",systemImage:"yensign.arrow.circlepath")}
                     Button {tool = .world} label: {Label("世界时间",systemImage:"globe")}
-                    Button {openWindow(id:"clipboard")} label: {Label("剪贴板历史",systemImage:"doc.on.clipboard")}
                 }.buttonStyle(.bordered)
                 if !badges.trusted {Button {badges.requestPermission()} label: {Label("开启辅助功能权限以显示软件通知角标",systemImage:"bell.badge")}.buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)}
                 section("常用软件",group:0)
@@ -49,22 +45,15 @@ struct HomePanel:View {
             }.padding(.horizontal,20).padding(.vertical,10)
         }.accessibilityLabel("Biu主页").sheet(item:$tool) {tool in QuickToolsPanel(tool:tool)}.task {await badges.watch()}
     }
-    private var recentApplications:some View {
+    private var recentApplicationsList:some View {
         let entries=recentApps.visible(excluding:home.items)
-        return Button {showRecentApps.toggle()} label: {
-            VStack(spacing:6) {
-                Image(systemName:"clock.arrow.circlepath").font(.system(size:29,weight:.medium)).foregroundStyle(Color.accentColor).frame(width:50,height:50).background(Color.accentColor.opacity(0.09),in:RoundedRectangle(cornerRadius:12))
-                Text("最近打开 App").font(.system(size:12)).lineLimit(1).minimumScaleFactor(0.75)
-            }.padding(8).frame(maxWidth:.infinity,minHeight:88).contentShape(Rectangle())
-        }.buttonStyle(.plain).accessibilityLabel("最近打开App").help("展开最近打开的App列表")
-            .popover(isPresented:$showRecentApps,arrowEdge:.bottom) {
-                VStack(alignment:.leading,spacing:12) {
+        return VStack(alignment:.leading,spacing:12) {
                     Text("最近打开 App").font(.headline)
                     if entries.isEmpty {Text("打开软件后会显示在这里，已固定的软件不重复显示。").font(.caption).foregroundStyle(.secondary).padding(.vertical,12)}
                     ForEach(entries) {entry in
                         HStack(spacing:10) {
                             Button {showRecentApps=false;launch(HomeShortcut(title:entry.name,kind:.application,target:entry.path))} label: {
-                                HStack(spacing:10) {Image(nsImage:NSWorkspace.shared.icon(forFile:entry.path)).resizable().scaledToFit().frame(width:28,height:28);Text(entry.name).font(.system(size:13)).lineLimit(1);Spacer()}.contentShape(Rectangle())
+                                HStack(spacing:10) {HomeApplicationIcon(path:entry.path,size:28);Text(entry.name).font(.system(size:13)).lineLimit(1);Spacer()}.contentShape(Rectangle())
                             }.buttonStyle(.plain).help(entry.path).accessibilityLabel("打开最近App："+entry.name)
                                 .padding(5).background(hoveredRecentApp == entry.path ? FindDuckHighlight.soft : .clear,in:RoundedRectangle(cornerRadius:8))
                                 .onHover {hoveredRecentApp=$0 ? entry.path : nil}
@@ -72,7 +61,6 @@ struct HomePanel:View {
                         }.padding(.vertical,3)
                     }
                 }.padding(16).frame(width:290).onExitCommand {showRecentApps=false}
-            }
     }
     @ViewBuilder private func section(_ title:String,group:Int)->some View {
         VStack(alignment:.leading,spacing:10) {
@@ -82,11 +70,12 @@ struct HomePanel:View {
                 HStack {Text(group == 1 ? "把常用网站放在这里" : "添加你常用的入口").font(.system(size:12)).foregroundStyle(.tertiary);Spacer();Button(group == 1 ? "添加网站" : "添加入口") {if group == 1 {addWebsite()} else {choose(group == 0 ? .application : .folder)}}.buttonStyle(.plain).font(.system(size:12)).foregroundStyle(Color.accentColor)}
                     .padding(14).background(Color.primary.opacity(0.025),in:RoundedRectangle(cornerRadius:12))
             } else {
-                LazyVGrid(columns:group == 0 ? [GridItem(.adaptive(minimum:78,maximum:100),spacing:14)] : columns,alignment:.leading,spacing:12) {
+                LazyVGrid(columns:group == 0 ? [GridItem(.adaptive(minimum:78,maximum:100),spacing:14,alignment:.top)] : columns,alignment:.leading,spacing:12) {
                     ForEach(entries) {item in
                         HomeTile(item:item,tags:model.tags(FileHit(url:URL(fileURLWithPath:item.target))),note:model.preferences.fileNotes?[item.target],badge:item.kind == .application ? badges.badge(for:item.target) : nil,isDragging:reorder.draggedID == item.id,action:{launch(item)},menu:{itemMenu(item)},accept:{id in reorder.accepts(id,group:item.group)},drop:{_ in withAnimation(reorderAnimation) {reorder.commit(to:home)}},frameChanged:{reorder.record(item.id,provider:$0)},dragBegan:{reorder.begin(item.id,items:home.items)},dragMoved:{point in withAnimation(reorderAnimation) {reorder.update(point)}},dragEnded:{withAnimation(reorderAnimation) {reorder.end()}})
+                            .popover(isPresented:Binding(get:{item.target == HomeShortcut.recentAppsTarget && showRecentApps},set:{showRecentApps=$0}),arrowEdge:.bottom) {recentApplicationsList}
                     }
-                    if group == 0 {recentApplications}
+
                 }.animation(reorderAnimation,value:entries.map(\.id))
             }
         }
@@ -107,6 +96,11 @@ struct HomePanel:View {
         }}
     }
     private func launch(_ item:HomeShortcut) {
+        if item.isLauncher {
+            if item.target == HomeShortcut.recentAppsTarget {showRecentApps.toggle()}
+            else {model.category = .all;model.resultSort = .relevance;model.pinnedApplications=Set(home.items.filter {$0.kind == .application}.map(\.target));model.recentApplications=Dictionary(recentApps.items.map {($0.path,$0.openedAt)},uniquingKeysWith:max);model.activateDirectory(URL(fileURLWithPath:"/Applications"));hotKeys.focusSearchInput()}
+            return
+        }
         if item.kind == .action {
             guard let action=HomeAction(rawValue:item.target) else {return}
             switch action {
@@ -172,18 +166,25 @@ private struct HomeTile:View {
     let dragEnded:()->Void
     @HomeState private var hovering=false
     private var dragImage:NSImage {
-        if item.kind == .application {return NSWorkspace.shared.icon(forFile:item.target)}
+        if item.kind == .application {return HomeCalendarIcon.applicationIcon(item.target)}
+        if item.isLauncher {return HomeLauncherIcon.image(item.target)}
         if item.kind == .folder || item.kind == .file {return FileIcons.shared.icon(for:FileHit(url:URL(fileURLWithPath:item.target),isDirectory:item.kind == .folder))}
         return NSImage(systemSymbolName:item.kind == .website ? "globe" : HomeAction(rawValue:item.target)?.symbol ?? "bolt",accessibilityDescription:nil) ?? NSImage()
     }
     var body:some View {
         Group {
-            if item.kind == .application {
+            if item.group == 0 {
                 VStack(spacing:6) {
-                    Image(nsImage:NSWorkspace.shared.icon(forFile:item.target)).resizable().scaledToFit().frame(width:50,height:50)
+                    if item.isLauncher {
+                        Image(nsImage:HomeLauncherIcon.image(item.target)).resizable().scaledToFit().frame(width:50,height:50)
+                    } else {
+                    HomeApplicationIcon(path:item.target,size:50)
                         .overlay(alignment:.topTrailing) {if let badge {Text(badge).font(.system(size:10,weight:.semibold)).foregroundStyle(.white).padding(.horizontal,4).frame(minWidth:17,minHeight:17).background(.red,in:Capsule()).offset(x:6,y:-3).accessibilityLabel("通知数量："+badge)}}
-                    Text(item.title).font(.system(size:12)).lineLimit(1)
-                }.padding(8).frame(maxWidth:.infinity,minHeight:88).background(Color.primary.opacity(hovering ? 0.065 : 0),in:RoundedRectangle(cornerRadius:12))
+                                        }
+                    Text(item.title).font(.system(size:12)).lineLimit(nil)
+                        .multilineTextAlignment(.center).fixedSize(horizontal:false,vertical:true)
+                        .frame(maxWidth:.infinity,alignment:.top)
+                }.padding(8).frame(maxWidth:.infinity,minHeight:88,alignment:.top).background(Color.primary.opacity(hovering ? 0.065 : 0),in:RoundedRectangle(cornerRadius:12))
             } else {
                 HStack(spacing:10) {
                     if item.kind == .folder || item.kind == .file {Image(nsImage:FileIcons.shared.icon(for:FileHit(url:URL(fileURLWithPath:item.target),isDirectory:item.kind == .folder))).resizable().scaledToFit().frame(width:30,height:30)}
@@ -195,7 +196,7 @@ private struct HomeTile:View {
             }
         }.opacity(isDragging ? 0.2 : 1).accessibilityHidden(true)
             .overlay {GeometryReader {geometry in
-                HomeItemInteraction(id:item.id,title:item.title,help:item.kind == .action ? item.title : item.target,dragImage:dragImage,dragSize:item.kind == .application ? 50 : 30,action:action,hover:{hovering=$0},menu:menu,accept:accept,drop:drop,frameChanged:frameChanged,dragBegan:dragBegan,dragMoved:dragMoved,dragEnded:dragEnded)
+                HomeItemInteraction(id:item.id,title:item.title,help:item.kind == .action ? item.title : item.target,dragImage:dragImage,dragSize:item.group == 0 ? 50 : 30,action:action,hover:{hovering=$0},menu:menu,accept:accept,drop:drop,frameChanged:frameChanged,dragBegan:dragBegan,dragMoved:dragMoved,dragEnded:dragEnded)
                     .frame(width:geometry.size.width,height:geometry.size.height)
             }}
     }

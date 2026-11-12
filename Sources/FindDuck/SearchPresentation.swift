@@ -58,7 +58,7 @@ enum SearchPresentation {
         let source = category == .folders ? directories : category == .all ? index.files + directories : index.files
         for file in source {
             if Task<Never, Never>.isCancelled { return [] }
-            if (category == .all || ResultCategory.kind(of: file) == category) && (term.isEmpty || file.name.localizedStandardContains(term)) { matches.append(file) }
+            if (category == .all || ResultCategory.kind(of: file) == category) && (term.isEmpty || SearchText.contains(file.name,term)) { matches.append(file) }
         }
         func score(_ file: FileHit) -> Int {
             let name = file.name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
