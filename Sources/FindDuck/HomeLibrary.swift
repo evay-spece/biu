@@ -18,6 +18,15 @@ struct HomeShortcut:Codable,Identifiable,Equatable,Sendable {
     static let applicationsTarget="biu:applications"
     var isLauncher:Bool {kind == .action && [Self.recentAppsTarget,Self.applicationsTarget].contains(target)}
     var group:Int {if isLauncher {return 0};return switch kind {case .application:0;case .website:1;case .folder,.file:3;case .action:2}}
+    var localFileURL:URL? {
+        guard kind == .application || kind == .file || kind == .folder else {return nil}
+        return URL(fileURLWithPath:target)
+    }
+    var annotationURL:URL? {
+        guard kind == .file || kind == .folder else {return nil}
+        return URL(fileURLWithPath:target)
+    }
+    var openURL:URL? {kind == .website ? HomeLibrary.websiteURL(target) : localFileURL}
 }
 @MainActor final class HomeLibrary:ObservableObject {
     private struct Settings:Codable {var items:[HomeShortcut];var resumeWindowSeconds:Double?;var builtinLaunchersAdded:Bool?}
@@ -46,8 +55,9 @@ struct HomeShortcut:Codable,Identifiable,Equatable,Sendable {
         }
     }
     private func normalizedApplication(_ item:HomeShortcut)->HomeShortcut {
-        let url=URL(fileURLWithPath:item.target)
-        guard item.kind == .application || ([HomeKind.file,.folder].contains(item.kind) && OilQueryEngine.isLaunchableApplication(url)) else {return item}
+        guard item.kind == .application || item.kind == .file || item.kind == .folder,
+              let url=item.localFileURL else {return item}
+        guard item.kind == .application || OilQueryEngine.isLaunchableApplication(url) else {return item}
         var result=item;result.kind = .application
         let names=ApplicationNames.read(url)
         func withoutExtension(_ name:String)->String {name.lowercased().hasSuffix(".app") ? String(name.dropLast(4)) : name}

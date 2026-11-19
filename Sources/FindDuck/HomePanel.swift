@@ -72,7 +72,8 @@ struct HomePanel:View {
             } else {
                 LazyVGrid(columns:group == 0 ? [GridItem(.adaptive(minimum:78,maximum:100),spacing:14,alignment:.top)] : columns,alignment:.leading,spacing:12) {
                     ForEach(entries) {item in
-                        HomeTile(item:item,tags:model.tags(FileHit(url:URL(fileURLWithPath:item.target))),note:model.preferences.fileNotes?[item.target],badge:item.kind == .application ? badges.badge(for:item.target) : nil,isDragging:reorder.draggedID == item.id,action:{launch(item)},menu:{itemMenu(item)},accept:{id in reorder.accepts(id,group:item.group)},drop:{_ in withAnimation(reorderAnimation) {reorder.commit(to:home)}},frameChanged:{reorder.record(item.id,provider:$0)},dragBegan:{reorder.begin(item.id,items:home.items)},dragMoved:{point in withAnimation(reorderAnimation) {reorder.update(point)}},dragEnded:{withAnimation(reorderAnimation) {reorder.end()}})
+                        let metadata=annotations(for:item)
+                        HomeTile(item:item,tags:metadata.tags,note:metadata.note,badge:item.kind == .application ? badges.badge(for:item.target) : nil,isDragging:reorder.draggedID == item.id,action:{launch(item)},menu:{itemMenu(item)},accept:{id in reorder.accepts(id,group:item.group)},drop:{_ in withAnimation(reorderAnimation) {reorder.commit(to:home)}},frameChanged:{reorder.record(item.id,provider:$0)},dragBegan:{reorder.begin(item.id,items:home.items)},dragMoved:{point in withAnimation(reorderAnimation) {reorder.update(point)}},dragEnded:{withAnimation(reorderAnimation) {reorder.end()}})
                             .popover(isPresented:Binding(get:{item.target == HomeShortcut.recentAppsTarget && showRecentApps},set:{showRecentApps=$0}),arrowEdge:.bottom) {recentApplicationsList}
                     }
 
@@ -95,6 +96,10 @@ struct HomePanel:View {
                 .allowsHitTesting(false)
         }}
     }
+    private func annotations(for item:HomeShortcut)->(tags:[FileTag],note:String?) {
+        guard let url=item.annotationURL else {return ([],nil)}
+        return (model.tags(FileHit(url:url,isDirectory:item.kind == .folder)),model.preferences.fileNotes?[item.target])
+    }
     private func launch(_ item:HomeShortcut) {
         if item.isLauncher {
             if item.target == HomeShortcut.recentAppsTarget {showRecentApps.toggle()}
@@ -112,8 +117,7 @@ struct HomePanel:View {
             }
             if action != .settings {hotKeys.focusSearchInput()};return
         }
-        let url=item.kind == .website ? HomeLibrary.websiteURL(item.target) : URL(fileURLWithPath:item.target)
-        guard let url else {return}
+        guard let url=item.openURL else {return}
         if NSWorkspace.shared.open(url) {hotKeys.hideSearch()} else {model.status="无法打开："+item.title}
     }
     private func choose(_ kind:HomeKind) {
